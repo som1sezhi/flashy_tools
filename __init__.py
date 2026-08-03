@@ -1,19 +1,23 @@
-from . import set_ease
+from . import set_ease, skew_controls
 
 
 bl_info = {
     "name": "flashy-tools",
-    "blender": (5, 0, 0),
+    "blender": (5, 2, 0),
     "category": "Animation",
 }
 
+modules = [set_ease, skew_controls]
+
 
 def register():
-    set_ease.register()
+    for module in modules:
+        module.register()
 
 
 def unregister():
-    set_ease.unregister()
+    for module in reversed(modules):
+        module.unregister()
 
 
 if __name__ == "__main__":
