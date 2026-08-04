@@ -6,11 +6,17 @@ A Blender addon mainly for my personal use, but hopefully it can be useful to ot
 
 ### Set Ease
 
+<img width="499" height="180" alt="image" src="https://github.com/user-attachments/assets/761923c3-2719-498e-b754-c36c922ae026" />
+
 A Dope Sheet sidebar panel allowing you to quickly view and change the easing interpolation/mode of selected keyframes.
 
 ### Skew Controls
 
-A set of operators (and a 3D Viewport side panel) that adds or removes skew controls from selected objects/bones. These custom properties allow you to skew the object/bone in the XY plane, which can be useful for cutout animation. This is implemented via a combination of drivers, Geometry Nodes, and Geometry Attribute constraints.
+<img width="266" height="115" alt="image" src="https://github.com/user-attachments/assets/71ae1897-4842-4ba4-b633-aefc8e38fa59" />
+
+<img width="548" height="249" alt="image" src="https://github.com/user-attachments/assets/f6cdef57-c822-4137-8501-8dca0e607ead" />
+
+A set of operators (and a 3D Viewport side panel) that adds or removes skew controls from selected objects/bones. These custom properties allow you to skew the object/bone in the XY plane, which can be useful for 2D cutout animation. This is implemented via a combination of drivers, Geometry Nodes, and Geometry Attribute constraints.
 
 Some notes/caveats:
 
