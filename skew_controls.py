@@ -414,7 +414,8 @@ def get_single_vertex_mesh_object(sibling: bpy.types.Object) -> bpy.types.Object
         return None
     else:
         # search for shearcalc obj in same collection as sibling
-        # TODO: improve handling of case where sibling is in multiple collections?
+        # (an arbitrary collection will be chosen if the sibling is in
+        # multiple collections)
         for collection in sibling.users_collection:
             for obj in collection.objects:
                 if (
@@ -479,13 +480,13 @@ def has_skew_controls(bone_or_obj: PoseBoneOrObject) -> bool:
 
 
 def add_skew_controls(context: bpy.types.Context, bone_or_obj: PoseBoneOrObject):
-    # add or get single-vertex mesh object parented to armature/object
+    # add or get single-vertex mesh object that is a sibling to armature/object
     if isinstance(bone_or_obj, bpy.types.PoseBone):
         armature_obj = bone_or_obj.id_data
-        parent = armature_obj
+        sibling = armature_obj
     else:
-        parent = bone_or_obj
-    shearcalc_obj = get_or_create_single_vertex_mesh_object(parent)
+        sibling = bone_or_obj
+    shearcalc_obj = get_or_create_single_vertex_mesh_object(sibling)
 
     # add geometry nodes modifier
     name = bone_or_obj.name
@@ -535,12 +536,8 @@ def add_skew_controls(context: bpy.types.Context, bone_or_obj: PoseBoneOrObject)
         driver.expression = var.name
 
     # add geometry attribute constraints to bone
-    attr_names = [
-        f"{prefix}_u",
-        f"{prefix}_sigma",
-        f"{prefix}_v",
-    ]
-    for attr_name in attr_names:
+    for suffix in ("u", "sigma", "v"):
+        attr_name = prefix + "_" + suffix
         constraint: bpy.types.GeometryAttributeConstraint = bone_or_obj.constraints.new(
             "GEOMETRY_ATTRIBUTE"
         )
@@ -555,11 +552,35 @@ def add_skew_controls(context: bpy.types.Context, bone_or_obj: PoseBoneOrObject)
         constraint.mix_scl = True
 
 
+def check_attribute_usage(shearcalc_obj: bpy.types.Object, prefix: str) -> bool:
+    """Return True iff any Geometry Attribute constraints in the project
+    have the given target and are using attributes with the given prefix."""
+
+    def _check_constraint(constraint: bpy.types.Constraint):
+        return (
+            constraint.type == "GEOMETRY_ATTRIBUTE"
+            and constraint.name.startswith("GeometryAttribute_Shear_")
+            and constraint.target == shearcalc_obj
+            and constraint.attribute_name.rsplit("_", 1)[0] == prefix
+        )
+
+    for obj in bpy.data.objects:
+        if any(map(_check_constraint, obj.constraints)):
+            return True
+        if obj.pose:
+            for pose_bone in obj.pose.bones:
+                if any(map(_check_constraint, pose_bone.constraints)):
+                    return True
+    return False
+
+
 def remove_skew_controls(
     bone_or_obj: PoseBoneOrObject,
 ) -> Literal["complete", "partial", "skipped"]:
-    # find original bone name used as attribute name prefix
-    original_name = None
+    # extract info about the geometry nodes modifier (which shearcalc object,
+    # which prefix) from the constraints
+    shearcalc_obj: bpy.types.Object | None = None
+    prefix: str | None = None
     for constraint in bone_or_obj.constraints:
         if (
             constraint.type == "GEOMETRY_ATTRIBUTE"
@@ -570,7 +591,8 @@ def remove_skew_controls(
                 or constraint.attribute_name.endswith("_v")
             )
         ):
-            original_name = constraint.attribute_name.rsplit("_", 1)[0]
+            prefix = constraint.attribute_name.rsplit("_", 1)[0]
+            shearcalc_obj = constraint.target
             break
 
     # remove custom properties
@@ -591,18 +613,15 @@ def remove_skew_controls(
 
     # remove geometry nodes modifier from _shearcalc object
     deleted_modifier = False
-    if isinstance(bone_or_obj, bpy.types.PoseBone):
-        armature_obj = bone_or_obj.id_data
-        shearcalc_obj: bpy.types.Object | None = get_single_vertex_mesh_object(
-            armature_obj
-        )
-    else:
-        shearcalc_obj: bpy.types.Object | None = get_single_vertex_mesh_object(
-            bone_or_obj
-        )
-    if shearcalc_obj is not None and original_name is not None:
-        modifier_name = f"ComputeShearTransforms_{original_name}"
-        if modifier_name in shearcalc_obj.modifiers:
+    if shearcalc_obj is not None and prefix is not None:
+        modifier_name = f"ComputeShearTransforms_{prefix}"
+        # only remove the modifier if it exists and no other constraints
+        # are using it.
+        # e.g. if a bone or object is duplicated, then 2 sets of constraints
+        # on 2 different objects now refer to the same modifier's attributes.
+        if modifier_name in shearcalc_obj.modifiers and not check_attribute_usage(
+            shearcalc_obj, prefix
+        ):
             shearcalc_obj.modifiers.remove(shearcalc_obj.modifiers[modifier_name])
             deleted_modifier = True
 
@@ -643,25 +662,6 @@ class FLASHY_OP_add_skew_controls(bpy.types.Operator):
         skip_count = 0
         selection = get_selection(context)
         if selection:
-            # check if each selected armature/object is part of only 1 collection,
-            # and cancel the operation if this is not the case
-            if context.mode == "POSE":
-                armatures = set(bone.id_data for bone in selection)
-                objs_in_multiple_colls = list(
-                    arm for arm in armatures if len(arm.users_collection) > 1
-                )
-            else:
-                objs_in_multiple_colls = list(
-                    obj for obj in selection if len(obj.users_collection) > 1
-                )
-            if objs_in_multiple_colls:
-                self.report(
-                    {"ERROR"},
-                    "Cannot add controls to the following objects linked to multiple collections: "
-                    + ", ".join(obj.name for obj in objs_in_multiple_colls),
-                )
-                return {"CANCELLED"}
-
             # add the skew controls
             for bone_or_obj in selection:
                 if not has_skew_controls(bone_or_obj):
