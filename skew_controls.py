@@ -405,19 +405,29 @@ def compute_shear_transforms_1_node_group() -> bpy.types.NodeTree:
     return compute_shear_transforms_1
 
 
-def get_single_vertex_mesh_object(parent: bpy.types.Object) -> bpy.types.Object | None:
-    """Get the single-vertex shearcalc object parented to the given object."""
-    # return vertex mesh object if already exists
-    for child in parent.children:
-        if child.name.startswith("_shearcalc") and child.type == "MESH":
-            return child
-    return None
+def get_single_vertex_mesh_object(sibling: bpy.types.Object) -> bpy.types.Object | None:
+    """Get the single-vertex shearcalc object that is a sibling to the given object."""
+    if sibling.parent:
+        for child in sibling.parent.children:
+            if child.name.startswith("_shearcalc") and child.type == "MESH":
+                return child
+        return None
+    else:
+        # search for shearcalc obj in same collection as sibling
+        # TODO: improve handling of case where sibling is in multiple collections?
+        for collection in sibling.users_collection:
+            for obj in collection.objects:
+                if (
+                    obj.parent is None
+                    and obj.name.startswith("_shearcalc")
+                    and obj.type == "MESH"
+                ):
+                    return obj
+        return None
 
 
-def create_single_vertex_mesh_object(
-    context: bpy.types.Context, parent: bpy.types.Object
-) -> bpy.types.Object:
-    """Create the single-vertex shearcalc object parented to the given object."""
+def create_single_vertex_mesh_object(sibling: bpy.types.Object) -> bpy.types.Object:
+    """Create the single-vertex shearcalc object as a sibling to the given object."""
     # create mesh data with a single vertex, or fetch existing
     mesh = bpy.data.meshes.get("_shearcalc_mesh")
     if mesh is None:
@@ -427,10 +437,12 @@ def create_single_vertex_mesh_object(
 
     # create mesh object
     obj = bpy.data.objects.new("_shearcalc", mesh)
-    if context.collection is not None:
-        context.collection.objects.link(obj)
+    # add shearcalc obj to sibling's collection.
+    # all objs belong to at least one collection (i think), so this should
+    # always work
+    sibling.users_collection[0].objects.link(obj)
 
-    obj.parent = parent
+    obj.parent = sibling.parent
     obj.hide_viewport = True
     obj.hide_render = True
 
@@ -438,13 +450,13 @@ def create_single_vertex_mesh_object(
 
 
 def get_or_create_single_vertex_mesh_object(
-    context: bpy.types.Context, parent: bpy.types.Object
+    sibling: bpy.types.Object,
 ) -> bpy.types.Object:
-    """Get the single-vertex shearcalc object parented to the given object,
-    or create it if it doens't exist."""
-    obj = get_single_vertex_mesh_object(parent)
+    """Get the single-vertex shearcalc object that is a sibling to the
+    given object, or create it if it doens't exist."""
+    obj = get_single_vertex_mesh_object(sibling)
     if obj is None:
-        obj = create_single_vertex_mesh_object(context, parent)
+        obj = create_single_vertex_mesh_object(sibling)
     return obj
 
 
@@ -473,7 +485,7 @@ def add_skew_controls(context: bpy.types.Context, bone_or_obj: PoseBoneOrObject)
         parent = armature_obj
     else:
         parent = bone_or_obj
-    shearcalc_obj = get_or_create_single_vertex_mesh_object(context, parent)
+    shearcalc_obj = get_or_create_single_vertex_mesh_object(parent)
 
     # add geometry nodes modifier
     name = bone_or_obj.name
@@ -631,6 +643,26 @@ class FLASHY_OP_add_skew_controls(bpy.types.Operator):
         skip_count = 0
         selection = get_selection(context)
         if selection:
+            # check if each selected armature/object is part of only 1 collection,
+            # and cancel the operation if this is not the case
+            if context.mode == "POSE":
+                armatures = set(bone.id_data for bone in selection)
+                objs_in_multiple_colls = list(
+                    arm for arm in armatures if len(arm.users_collection) > 1
+                )
+            else:
+                objs_in_multiple_colls = list(
+                    obj for obj in selection if len(obj.users_collection) > 1
+                )
+            if objs_in_multiple_colls:
+                self.report(
+                    {"ERROR"},
+                    "Cannot add controls to the following objects linked to multiple collections: "
+                    + ", ".join(obj.name for obj in objs_in_multiple_colls),
+                )
+                return {"CANCELLED"}
+
+            # add the skew controls
             for bone_or_obj in selection:
                 if not has_skew_controls(bone_or_obj):
                     add_skew_controls(context, bone_or_obj)
