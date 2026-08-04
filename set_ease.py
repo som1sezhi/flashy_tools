@@ -2,10 +2,11 @@ import bpy
 
 
 def get_selected_keyframes(context: bpy.types.Context):
-    for fcurve in context.editable_fcurves:
-        for kf in fcurve.keyframe_points:
-            if kf.select_control_point:
-                yield kf
+    if context.editable_fcurves:
+        for fcurve in context.editable_fcurves:
+            for kf in fcurve.keyframe_points:
+                if kf.select_control_point:
+                    yield kf
 
 
 class FLASHY_PT_set_ease(bpy.types.Panel):
