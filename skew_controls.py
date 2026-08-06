@@ -1,6 +1,8 @@
 import bpy
 from typing import Literal
 
+# TODO: XZ axis skewing
+
 
 def compute_shear_transforms_1_node_group() -> bpy.types.NodeTree:
     """Create the Compute Shear Transforms node group.
@@ -414,8 +416,7 @@ def get_single_vertex_mesh_object(sibling: bpy.types.Object) -> bpy.types.Object
         return None
     else:
         # search for shearcalc obj in same collection as sibling
-        # (an arbitrary collection will be chosen if the sibling is in
-        # multiple collections)
+        # TODO: look for geo nodes modifier matching a wanted prefix
         for collection in sibling.users_collection:
             for obj in collection.objects:
                 if (
@@ -439,6 +440,7 @@ def create_single_vertex_mesh_object(sibling: bpy.types.Object) -> bpy.types.Obj
     # create mesh object
     obj = bpy.data.objects.new("_shearcalc", mesh)
     # add shearcalc obj to sibling's collection.
+    # an arbitrary collection will be chosen if the sibling is in multiple.
     # all objs belong to at least one collection (i think), so this should
     # always work
     sibling.users_collection[0].objects.link(obj)

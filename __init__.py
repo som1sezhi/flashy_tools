@@ -1,4 +1,4 @@
-from . import set_ease, skew_controls
+from . import frame_picker, set_ease, skew_controls
 
 
 bl_info = {
@@ -7,7 +7,7 @@ bl_info = {
     "category": "Animation",
 }
 
-modules = [set_ease, skew_controls]
+modules = [set_ease, skew_controls, frame_picker]
 
 
 def register():
