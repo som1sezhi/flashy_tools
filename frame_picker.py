@@ -1,4 +1,5 @@
 import bpy
+import re
 
 
 FP_PROP_NAME = "Frame"
@@ -81,6 +82,23 @@ def should_keep_driver(
     return False
 
 
+def get_bone_from_driver(driver: bpy.types.FCurve):
+    assert driver.driver is not None
+    for var in driver.driver.variables:
+        if var.targets is None:
+            continue
+        for target in var.targets:
+            if isinstance(target.id, bpy.types.Object) and target.id.type == "ARMATURE":
+                m = re.fullmatch(
+                    rf'pose.bones\["(.*)"\]\["{FP_PROP_NAME}"\]', target.data_path
+                )
+                if m and m[1] in target.id.pose.bones:
+                    bone = target.id.pose.bones[m[1]]
+                    if FP_PROP_NAME in bone and type(bone[FP_PROP_NAME]) is int:
+                        return target.id, bone
+    return None, None
+
+
 def save_object_selection(vl: bpy.types.ViewLayer):
     return (
         vl.objects.active,
@@ -158,6 +176,123 @@ def gather_frames(tree_node: bpy.types.GreasePencilTreeNode) -> set[int]:
     return frames
 
 
+def generate_pose_assets(
+    context: bpy.types.Context,
+    gp_obj: bpy.types.Object,
+    tree_node: bpy.types.GreasePencilTreeNode,
+    armature: bpy.types.Object,
+    bone: bpy.types.PoseBone,
+    base_name: str,
+):
+    # add keyframe to frame property so that poselib picks it up
+    # when creating a new pose asset
+    should_insert_keyframe = True
+    if armature.animation_data and armature.animation_data.action:
+        prop_data_path = frame_picker_data_path(bone.name)
+        should_insert_keyframe = not any(
+            fcurve.data_path == prop_data_path and len(fcurve.keyframe_points) > 0
+            for layer in armature.animation_data.action.layers
+            for strip in layer.strips
+            if isinstance(strip, bpy.types.ActionKeyframeStrip)
+            for channelbag in strip.channelbags
+            for fcurve in channelbag.fcurves
+        )
+    if should_insert_keyframe:
+        bone.keyframe_insert(f'["{FP_PROP_NAME}"]', frame=1)
+
+    # gather temp_context variables
+    window: bpy.types.Window = bpy.context.window
+    screen = window.screen
+    area = next((a for a in screen.areas if a.type == "VIEW_3D"))
+    region = next((r for r in area.regions if r.type == "WINDOW"))
+    space = area.spaces.active
+    assert isinstance(space, bpy.types.SpaceView3D)
+    original_view_persp = space.region_3d.view_perspective
+
+    # set up pose asset preview camera
+    cam = bpy.data.cameras.new("PreviewCamera")
+    cam.type = "ORTHO"
+    cam_obj = bpy.data.objects.new("PreviewCamera", cam)
+    context.scene.collection.objects.link(cam_obj)
+
+    # set our camera as active
+    old_active_camera = context.scene.camera
+    context.scene.camera = cam_obj
+
+    # hide all gp layers except the ones we're focusing on
+    original_hide_state = hide_all_gp_layers_except(gp_obj.data, tree_node)
+    # save selections and mode to restore later
+    vl: bpy.types.ViewLayer = context.view_layer
+    original_mode = context.mode
+    if original_mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+    obj_selection_state = save_object_selection(vl)
+    select_only(armature, vl)
+    bpy.ops.object.mode_set(mode="POSE")
+    bone_selection_state = save_bone_selection(armature)
+    # select only the chosen bone
+    bpy.ops.pose.select_all(action="DESELECT")
+    bone.select = True
+    armature.data.bones.active = bone.bone
+
+    # delete existing pose assets
+    prefix = asset_name_prefix(base_name)
+    actions_to_delete = [
+        a for a in bpy.data.actions if a.name.rsplit("_", 1)[0] == prefix
+    ]
+    for a in actions_to_delete:
+        bpy.data.actions.remove(a, do_unlink=True)
+    # create pose assets for each frame
+    # TODO: ensure modifier is enabled beforehand so the previews are correct
+    frame_nums = gather_frames(tree_node)
+    zfill_len = max(len(str(n)) for n in frame_nums)
+    for frame_num in frame_nums:
+        bone[FP_PROP_NAME] = frame_num
+        armature.update_tag()
+        context.view_layer.update()
+
+        # position preview camera
+        bpy.ops.object.mode_set(mode="OBJECT")
+        select_only(gp_obj, vl)
+        with context.temp_override(
+            window=window, area=area, region=region, screen=screen
+        ):
+            # view perspective cannot be camera or camera_to_view poll will fail
+            space.region_3d.view_perspective = "ORTHO"
+            bpy.ops.view3d.camera_to_view()
+            bpy.ops.view3d.camera_to_view_selected()
+        cam.ortho_scale *= 1.25
+        select_only(armature, vl)
+        bpy.ops.object.mode_set(mode="POSE")
+
+        bpy.ops.poselib.create_pose_asset(
+            pose_name=f"{prefix}_{str(frame_num).zfill(zfill_len)}",
+            asset_library_reference="LOCAL",
+            catalog_path="Frame Picker",
+        )
+    # TODO: for each pose action, clear all channels other than our prop
+
+    # restore selections, mode, and layer hide state
+    restore_bone_selection(armature, bone_selection_state)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    restore_object_selection(vl, obj_selection_state)
+    if original_mode != "OBJECT":
+        bpy.ops.object.mode_set(mode=context_mode_to_object_mode(original_mode))
+    restore_gp_layers(gp_obj.data, original_hide_state)
+
+    # restore previous active camera and remove our preview camera
+    context.scene.camera = old_active_camera
+    bpy.data.objects.remove(cam_obj, do_unlink=True)
+    space.region_3d.view_perspective = original_view_persp
+
+    # remove added keyframe
+    if should_insert_keyframe:
+        bone.keyframe_delete(f'["{FP_PROP_NAME}"]', frame=1)
+
+    # default to first frame of the layer/group
+    bone[FP_PROP_NAME] = min(frame_nums)
+
+
 def multiline_label(layout: bpy.types.UILayout, text: list[str], icon="STATUS_WARNING"):
     layout.label(text=text[0], icon=icon)
     for line in text[1:]:
@@ -181,8 +316,9 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
         name="Bone", description="Bone that will hold the frame picker control."
     )
     should_create_assets: bpy.props.BoolProperty(
-        name="Create Pose Assets",
+        name="Generate Pose Assets",
         description="Whether pose assets should be created for each Grease Pencil frame.",
+        default=True,
     )
     base_name: bpy.props.StringProperty(
         name="Asset Base Name",
@@ -257,6 +393,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
                                 "but it is not of integer type.",
                                 "It will be replaced with a property of integer type.",
                             ],
+                            "INFO",
                         )
 
         layout.separator(type="LINE")
@@ -267,7 +404,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
 
             if self.base_name:
                 prefix = asset_name_prefix(self.base_name)
-                layout.label(text=f'Asset names will use the prefix "{prefix}"')
+                layout.label(text=f'Pose asset names will have prefix "{prefix}"')
 
                 if bpy.data.actions and any(
                     a.name.rsplit("_", 1)[0] == prefix for a in bpy.data.actions
@@ -306,7 +443,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
         # save old value to restore at the end
         try:
             old_prop_val = int(bone[FP_PROP_NAME])
-        except KeyError | ValueError:
+        except (KeyError, ValueError):
             old_prop_val = None
         bone[FP_PROP_NAME] = 1  # set prop as integer
         bone.property_overridable_library_set(f'["{FP_PROP_NAME}"]', True)
@@ -315,9 +452,15 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
         gp_obj = context.active_object
         mod = get_modifier_if_exists(gp_obj, tree_node)
         if mod is None:
+            # modifier name will be used to suggest a base_name value
+            # if the user runs this operator on an existing setup
+            if self.should_create_assets and self.base_name:
+                mod_name_suffix = self.base_name
+            else:
+                mod_name_suffix = tree_node.name
             mod: bpy.types.GreasePencilTimeModifier = (
                 context.active_object.modifiers.new(
-                    "TimeOffset_" + tree_node.name, "GREASE_PENCIL_TIME"
+                    "TimeOffset_" + mod_name_suffix, "GREASE_PENCIL_TIME"
                 )
             )
             mod.mode = "FIX"
@@ -347,114 +490,16 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
             var.targets[0].id = armature
             var.targets[0].data_path = prop_data_path
             driver.expression = var.name
-            # if we don't do this, the data path may report as broken in the driver
+            # if this isn't added, the data path may report as broken in the driver,
+            # leading to broken preview images
             armature.update_tag()
             context.view_layer.update()
 
-        # add keyframe to frame property so that poselib picks it up
-        # when creating a new pose asset
-        should_insert_keyframe = True
-        if armature.animation_data and armature.animation_data.action:
-            should_insert_keyframe = not any(
-                fcurve.data_path == prop_data_path and len(fcurve.keyframe_points) > 0
-                for layer in armature.animation_data.action.layers
-                for strip in layer.strips
-                if isinstance(strip, bpy.types.ActionKeyframeStrip)
-                for channelbag in strip.channelbags
-                for fcurve in channelbag.fcurves
+        if self.should_create_assets:
+            generate_pose_assets(
+                context, gp_obj, tree_node, armature, bone, self.base_name
             )
-        if should_insert_keyframe:
-            bone.keyframe_insert(f'["{FP_PROP_NAME}"]', frame=1)
 
-        # gather temp_context variables
-        window: bpy.types.Window = bpy.context.window
-        screen = window.screen
-        area = next((a for a in screen.areas if a.type == "VIEW_3D"))
-        region = next((r for r in area.regions if r.type == "WINDOW"))
-        space = area.spaces.active
-        assert isinstance(space, bpy.types.SpaceView3D)
-        original_view_persp = space.region_3d.view_perspective
-
-        # set up pose asset preview camera
-        cam = bpy.data.cameras.new("PreviewCamera")
-        cam.type = "ORTHO"
-        cam_obj = bpy.data.objects.new("PreviewCamera", cam)
-        context.scene.collection.objects.link(cam_obj)
-        #
-
-        # set our camera as active
-        old_active_camera = context.scene.camera
-        context.scene.camera = cam_obj
-
-        # hide all gp layers except the ones we're focusing on
-        original_hide_state = hide_all_gp_layers_except(gp_obj.data, tree_node)
-        # save selections and mode to restore later
-        vl: bpy.types.ViewLayer = context.view_layer
-        original_mode = context.mode
-        if original_mode != "OBJECT":
-            bpy.ops.object.mode_set(mode="OBJECT")
-        obj_selection_state = save_object_selection(vl)
-        select_only(armature, vl)
-        bpy.ops.object.mode_set(mode="POSE")
-        bone_selection_state = save_bone_selection(armature)
-        # select only the chosen bone
-        bpy.ops.pose.select_all(action="DESELECT")
-        bone.select = True
-        armature.data.bones.active = bone.bone
-
-        # delete existing pose assets
-        prefix = asset_name_prefix(self.base_name)
-        actions_to_delete = [
-            a for a in bpy.data.actions if a.name.rsplit("_", 1)[0] == prefix
-        ]
-        for a in actions_to_delete:
-            bpy.data.actions.remove(a, do_unlink=True)
-        # create pose assets for each frame
-        # TODO: ensure modifier is enabled beforehand so the previews are correct
-        frame_nums = gather_frames(tree_node)
-        zfill_len = max(len(str(n)) for n in frame_nums)
-        for frame_num in frame_nums:
-            bone[FP_PROP_NAME] = frame_num
-            armature.update_tag()
-            context.view_layer.update()
-
-            # position preview camera
-            bpy.ops.object.mode_set(mode="OBJECT")
-            select_only(gp_obj, vl)
-            with context.temp_override(
-                window=window, area=area, region=region, screen=screen
-            ):
-                # view perspective cannot be camera or camera_to_view poll will fail
-                space.region_3d.view_perspective = "ORTHO"
-                bpy.ops.view3d.camera_to_view()
-                bpy.ops.view3d.camera_to_view_selected()
-            cam.ortho_scale *= 1.25
-            select_only(armature, vl)
-            bpy.ops.object.mode_set(mode="POSE")
-
-            bpy.ops.poselib.create_pose_asset(
-                pose_name=f"{prefix}_{str(frame_num).zfill(zfill_len)}",
-                asset_library_reference="LOCAL",
-                catalog_path="Frame Picker",
-            )
-        # TODO: for each pose action, clear all channels other than our prop
-
-        # restore selections, mode, and layer hide state
-        restore_bone_selection(armature, bone_selection_state)
-        bpy.ops.object.mode_set(mode="OBJECT")
-        restore_object_selection(vl, obj_selection_state)
-        if original_mode != "OBJECT":
-            bpy.ops.object.mode_set(mode=context_mode_to_object_mode(original_mode))
-        restore_gp_layers(gp_obj.data, original_hide_state)
-
-        # restore previous active camera and remove our preview camera
-        context.scene.camera = old_active_camera
-        bpy.data.objects.remove(cam_obj, do_unlink=True)
-        space.region_3d.view_perspective = original_view_persp
-
-        # remove added keyframe
-        if should_insert_keyframe:
-            bone.keyframe_delete(f'["{FP_PROP_NAME}"]', frame=1)
         # restore previous value of Frame, if any
         if old_prop_val is not None:
             bone[FP_PROP_NAME] = old_prop_val
@@ -474,7 +519,7 @@ class FLASHY_PT_frame_picker(bpy.types.Panel):
     """Panel for generating frame picker-like poses"""
 
     bl_category = "Flashy"
-    bl_label = "Frame Picker Setup"
+    bl_label = "Frame Picker"
     bl_idname = "FLASHY_PT_frame_picker"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -487,14 +532,56 @@ class FLASHY_PT_frame_picker(bpy.types.Panel):
         layout = self.layout
 
         tree_node = get_active_grease_pencil_tree_node(context)
-        if tree_node:
-            layout.label(text=tree_node.name)
-            op = layout.operator("flashy.setup_frame_picker", text="Set Up")
-            op.base_name = tree_node.name
-        else:
+
+        if tree_node is None:
             layout.label(text="No Grease Pencil object selected")
             return
-        # TODO: setting for toggling the time offset modifier
+
+        gp_obj = context.active_object
+        mod = get_modifier_if_exists(gp_obj, tree_node)
+        driver = get_driver_if_exists(gp_obj, mod.name) if mod else None
+        armature_obj, bone = get_bone_from_driver(driver) if driver else (None, None)
+
+        is_layer = isinstance(tree_node, bpy.types.GreasePencilLayer)
+
+        layout.label(text=gp_obj.name, icon="OUTLINER_OB_GREASEPENCIL")
+        layout.label(
+            text=tree_node.name,
+            icon="OUTLINER_DATA_GP_LAYER" if is_layer else "GREASEPENCIL_LAYER_GROUP",
+        )
+
+        if bone is None:
+            # a frame picker has not been set up yet.
+            # show setup operators
+            op = layout.operator(
+                "flashy.setup_frame_picker",
+                text=f'Set Up FP for "{tree_node.name}"',
+            )
+            op.base_name = tree_node.name
+        else:
+            layout.separator(type="LINE")
+            layout.label(text="Frame Picker Location:")
+            layout.label(text=armature_obj.name, icon="OUTLINER_OB_ARMATURE")
+            layout.label(text=bone.name, icon="BONE_DATA")
+            layout.prop(bone, f'["{FP_PROP_NAME}"]', text=FP_PROP_NAME)
+            if bone[FP_PROP_NAME] != mod.offset:
+                layout.label(text=f"Actual Frame: {mod.offset}")
+
+            layout.separator(type="LINE")
+
+            enabled_txt = "Enabled" if mod.show_viewport else "Disabled"
+            layout.prop(mod, "show_viewport", text=f"{enabled_txt} in Viewport")
+
+            op = layout.operator(
+                "flashy.setup_frame_picker",
+                text=f'Redo Setup for "{tree_node.name}"',
+            )
+            op.armature = armature_obj.name
+            op.bone = bone.name
+            op.base_name = mod.name.split("_", 1)[-1]
+
+            # TODO: operators to copy frames between the current timeline frame
+            # and the currently selected frame in the picker
 
 
 classes = [
