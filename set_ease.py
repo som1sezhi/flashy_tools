@@ -33,8 +33,9 @@ class FLASHY_PT_set_ease(bpy.types.Panel):
             return enum
         return enum.replace("_", " ").title()
 
-    def draw(self, context):
+    def draw(self, context: bpy.types.Context):
         layout = self.layout
+        assert layout
 
         # figure out whether all selected keyframes share an
         # interpolation/easing type
@@ -47,6 +48,7 @@ class FLASHY_PT_set_ease(bpy.types.Panel):
                 common_ipo = kf.interpolation
                 common_easing = kf.easing
             else:
+                assert common_easing
                 # compare against first keyframe
                 if common_ipo != kf.interpolation:
                     common_ipo = "<multiple interpolations>"
@@ -57,17 +59,18 @@ class FLASHY_PT_set_ease(bpy.types.Panel):
 
         # draw the panel
         if common_easing is not None:
+            assert common_ipo
             layout.operator_menu_enum(
                 "action.interpolation_type",
                 "type",
                 text=self._get_text(common_ipo),
-                icon=self._get_icon(common_ipo),
+                icon=self._get_icon(common_ipo),  # type: ignore
             )
             layout.operator_menu_enum(
                 "action.easing_type",
                 "type",
                 text=self._get_text(common_easing),
-                icon=self._get_icon(common_easing),
+                icon=self._get_icon(common_easing),  # type: ignore
             )
         else:
             layout.label(text="No keyframes selected")

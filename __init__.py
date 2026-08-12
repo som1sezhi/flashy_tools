@@ -1,6 +1,5 @@
 from . import frame_picker, set_ease, skew_controls
 
-
 bl_info = {
     "name": "flashy-tools",
     "blender": (5, 2, 0),

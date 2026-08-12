@@ -1,5 +1,7 @@
+# pyright: reportAttributeAccessIssue=false
+from typing import Literal, cast
+
 import bpy
-from typing import Literal
 
 # TODO: XZ axis skewing
 
@@ -20,24 +22,30 @@ def compute_shear_transforms_1_node_group() -> bpy.types.NodeTree:
     # compute_shear_transforms_1 interface
 
     # Socket Geometry
-    geometry_socket = compute_shear_transforms_1.interface.new_socket(
-        name="Geometry", in_out="OUTPUT", socket_type="NodeSocketGeometry"
+    geometry_socket = compute_shear_transforms_1.interface.new_socket(  # type: ignore
+        name="Geometry",
+        in_out="OUTPUT",
+        socket_type="NodeSocketGeometry",  # type: ignore
     )
     geometry_socket.attribute_domain = "POINT"
     geometry_socket.default_input = "VALUE"
     geometry_socket.structure_type = "AUTO"
 
     # Socket Geometry
-    geometry_socket_1 = compute_shear_transforms_1.interface.new_socket(
-        name="Geometry", in_out="INPUT", socket_type="NodeSocketGeometry"
+    geometry_socket_1 = compute_shear_transforms_1.interface.new_socket(  # type: ignore
+        name="Geometry",
+        in_out="INPUT",
+        socket_type="NodeSocketGeometry",  # type: ignore
     )
     geometry_socket_1.attribute_domain = "POINT"
     geometry_socket_1.default_input = "VALUE"
     geometry_socket_1.structure_type = "AUTO"
 
     # Socket X Skew
-    x_skew_socket = compute_shear_transforms_1.interface.new_socket(
-        name="X Skew", in_out="INPUT", socket_type="NodeSocketFloat"
+    x_skew_socket = compute_shear_transforms_1.interface.new_socket(  # type: ignore
+        name="X Skew",
+        in_out="INPUT",
+        socket_type="NodeSocketFloat",  # type: ignore
     )
     x_skew_socket.default_value = 0.0
     x_skew_socket.min_value = -3.4028234663852886e38
@@ -48,8 +56,10 @@ def compute_shear_transforms_1_node_group() -> bpy.types.NodeTree:
     x_skew_socket.structure_type = "AUTO"
 
     # Socket Y Skew
-    y_skew_socket = compute_shear_transforms_1.interface.new_socket(
-        name="Y Skew", in_out="INPUT", socket_type="NodeSocketFloat"
+    y_skew_socket = compute_shear_transforms_1.interface.new_socket(  # type: ignore
+        name="Y Skew",
+        in_out="INPUT",
+        socket_type="NodeSocketFloat",  # type: ignore
     )
     y_skew_socket.default_value = 0.0
     y_skew_socket.min_value = -3.4028234663852886e38
@@ -60,8 +70,10 @@ def compute_shear_transforms_1_node_group() -> bpy.types.NodeTree:
     y_skew_socket.structure_type = "AUTO"
 
     # Socket Prefix
-    prefix_socket = compute_shear_transforms_1.interface.new_socket(
-        name="Prefix", in_out="INPUT", socket_type="NodeSocketString"
+    prefix_socket = compute_shear_transforms_1.interface.new_socket(  # type: ignore
+        name="Prefix",
+        in_out="INPUT",
+        socket_type="NodeSocketString",  # type: ignore
     )
     prefix_socket.default_value = ""
     prefix_socket.subtype = "NONE"
@@ -471,6 +483,7 @@ def get_shear_transform_node_tree() -> bpy.types.NodeTree:
 
 
 def get_socket_id(node_group: bpy.types.NodeTree, socket_name: str) -> str:
+    assert node_group.interface
     return node_group.interface.items_tree[socket_name].identifier
 
 
@@ -478,22 +491,25 @@ PoseBoneOrObject = bpy.types.PoseBone | bpy.types.Object
 
 
 def has_skew_controls(bone_or_obj: PoseBoneOrObject) -> bool:
-    return "Skew" in bone_or_obj.keys()
+    return "Skew" in bone_or_obj
 
 
 def add_skew_controls(context: bpy.types.Context, bone_or_obj: PoseBoneOrObject):
     # add or get single-vertex mesh object that is a sibling to armature/object
     if isinstance(bone_or_obj, bpy.types.PoseBone):
         armature_obj = bone_or_obj.id_data
-        sibling = armature_obj
+        sibling = cast(bpy.types.Object, armature_obj)
     else:
         sibling = bone_or_obj
     shearcalc_obj = get_or_create_single_vertex_mesh_object(sibling)
 
     # add geometry nodes modifier
     name = bone_or_obj.name
-    modifier: bpy.types.NodesModifier = shearcalc_obj.modifiers.new(
-        name=f"ComputeShearTransforms_{name}", type="NODES"
+    modifier = cast(
+        bpy.types.NodesModifier,
+        shearcalc_obj.modifiers.new(
+            name=f"ComputeShearTransforms_{name}", type="NODES"
+        ),
     )
     modifier.node_group = get_shear_transform_node_tree()
     # set Prefix of geometry attribute names to bone/object name.
@@ -505,6 +521,7 @@ def add_skew_controls(context: bpy.types.Context, bone_or_obj: PoseBoneOrObject)
     # name for our own purposes
     prefix = modifier.name.split("_", 1)[1]
     prefix_socket_id = get_socket_id(modifier.node_group, "Prefix")
+    assert modifier.properties
     modifier.properties.inputs[prefix_socket_id]["value"] = prefix
     modifier.node_group.interface_update(context)
 
@@ -521,9 +538,12 @@ def add_skew_controls(context: bpy.types.Context, bone_or_obj: PoseBoneOrObject)
         # for some reason we have to add the driver at the object level and
         # write out this full path, or else it says the property is not found
         # or is not animatable
-        driver = shearcalc_obj.driver_add(
-            f'modifiers["{modifier.name}"].properties.inputs.{socket_id}.value'
-        ).driver
+        driver = cast(
+            bpy.types.Driver,
+            shearcalc_obj.driver_add(
+                f'modifiers["{modifier.name}"].properties.inputs.{socket_id}.value'
+            ).driver,
+        )
         driver.type = "SCRIPTED"
         var = driver.variables.new()
         var.name = "skew"
@@ -540,8 +560,9 @@ def add_skew_controls(context: bpy.types.Context, bone_or_obj: PoseBoneOrObject)
     # add geometry attribute constraints to bone
     for suffix in ("u", "sigma", "v"):
         attr_name = prefix + "_" + suffix
-        constraint: bpy.types.GeometryAttributeConstraint = bone_or_obj.constraints.new(
-            "GEOMETRY_ATTRIBUTE"
+        constraint = cast(
+            bpy.types.GeometryAttributeConstraint,
+            bone_or_obj.constraints.new("GEOMETRY_ATTRIBUTE"),
         )
         constraint.name = f"GeometryAttribute_Shear_{attr_name}"
         constraint.target = shearcalc_obj
@@ -599,7 +620,7 @@ def remove_skew_controls(
 
     # remove custom properties
     deleted_props = False
-    if "Skew" in bone_or_obj.keys():
+    if "Skew" in bone_or_obj:
         del bone_or_obj["Skew"]
         deleted_props = True
 
@@ -650,16 +671,16 @@ class FLASHY_OP_add_skew_controls(bpy.types.Operator):
 
     bl_idname = "flashy.add_skew_controls"
     bl_label = "Add Skew Controls"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER", "UNDO"}  # noqa: RUF012
 
     @classmethod
-    def poll(cls, context):
+    def poll(cls, context: bpy.types.Context):
         return (
             (context.mode == "POSE" or context.mode == "OBJECT")
             and get_selection(context)  # selection is nonempty
         )
 
-    def execute(self, context):
+    def execute(self, context: bpy.types.Context):
         add_count = 0
         skip_count = 0
         selection = get_selection(context)
@@ -690,16 +711,16 @@ class FLASHY_OP_remove_skew_controls(bpy.types.Operator):
 
     bl_idname = "flashy.remove_skew_controls"
     bl_label = "Remove Skew Controls"
-    bl_options = {"REGISTER", "UNDO"}
+    bl_options = {"REGISTER", "UNDO"}  # noqa: RUF012
 
     @classmethod
-    def poll(cls, context):
+    def poll(cls, context: bpy.types.Context):
         return (
             (context.mode == "POSE" or context.mode == "OBJECT")
             and get_selection(context)  # selection is nonempty
         )
 
-    def execute(self, context):
+    def execute(self, context: bpy.types.Context):
         counts = {"complete": 0, "partial": 0, "skipped": 0}
         selection = get_selection(context)
         if selection:
@@ -733,11 +754,12 @@ class FLASHY_PT_skew_controls(bpy.types.Panel):
     bl_region_type = "UI"
 
     @classmethod
-    def poll(cls, context):
+    def poll(cls, context: bpy.types.Context):
         return context.mode == "POSE" or context.mode == "OBJECT"
 
-    def draw(self, context):
+    def draw(self, context: bpy.types.Context):
         layout = self.layout
+        assert layout
 
         obj_type = "bone" if context.mode == "POSE" else "object"
 

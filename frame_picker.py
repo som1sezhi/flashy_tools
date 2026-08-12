@@ -1,6 +1,8 @@
-import bpy
 import re
+from collections.abc import Iterable
+from typing import cast
 
+import bpy
 
 FP_PROP_NAME = "Frame"
 
@@ -12,7 +14,7 @@ def get_active_grease_pencil_tree_node(
     return value implies that the active object is a Grease Pencil object."""
     obj = context.active_object
     if obj and obj.type == "GREASEPENCIL":
-        gp: bpy.types.GreasePencil = obj.data
+        gp = cast(bpy.types.GreasePencil, obj.data)
         if gp.layer_groups.active:
             return gp.layer_groups.active
         elif gp.layers.active:
@@ -38,7 +40,7 @@ def get_modifier_if_exists(
 ):
     for mod in obj.modifiers:
         if mod.type == "GREASE_PENCIL_TIME":
-            mod: bpy.types.GreasePencilTimeModifier
+            mod = cast(bpy.types.GreasePencilTimeModifier, mod)
             if (
                 mod.mode == "FIX"
                 and mod.tree_node_filter == tree_node.name
@@ -61,9 +63,10 @@ def get_driver_if_exists(
     obj: bpy.types.Object, modifier_name: str
 ) -> bpy.types.FCurve | None:
     driver_data_path = f'modifiers["{modifier_name.translate(escape_table)}"].offset'
-    for fcurve in obj.animation_data.drivers:
-        if fcurve.data_path == driver_data_path:
-            return fcurve
+    if obj.animation_data:
+        for fcurve in obj.animation_data.drivers:
+            if fcurve.data_path == driver_data_path:
+                return fcurve
     return None
 
 
@@ -88,7 +91,11 @@ def get_bone_from_driver(driver: bpy.types.FCurve):
         if var.targets is None:
             continue
         for target in var.targets:
-            if isinstance(target.id, bpy.types.Object) and target.id.type == "ARMATURE":
+            if (
+                isinstance(target.id, bpy.types.Object)
+                and target.id.type == "ARMATURE"
+                and target.id.pose
+            ):
                 m = re.fullmatch(
                     rf'pose.bones\["(.*)"\]\["{FP_PROP_NAME}"\]', target.data_path
                 )
@@ -114,16 +121,22 @@ def restore_object_selection(vl: bpy.types.ViewLayer, selection_state):
 
 
 def save_bone_selection(armature_obj: bpy.types.Object):
+    assert isinstance(armature_obj.data, bpy.types.Armature)
+    bones: Iterable[bpy.types.PoseBone] = (
+        armature_obj.pose.bones if armature_obj.pose else []
+    )
     return (
-        armature_obj.data.bones.active,
-        {b.name: b.select for b in armature_obj.pose.bones},
+        cast(bpy.types.Armature, armature_obj.data).bones.active,
+        {b.name: b.select for b in bones},
     )
 
 
 def restore_bone_selection(armature_obj: bpy.types.Object, selection_state):
+    assert isinstance(armature_obj.data, bpy.types.Armature)
     original_active_bone, original_bone_selection = selection_state
-    for b in armature_obj.pose.bones:
-        b.select = original_bone_selection[b.name]
+    if armature_obj.pose:
+        for b in armature_obj.pose.bones:
+            b.select = original_bone_selection[b.name]
     armature_obj.data.bones.active = original_active_bone
 
 
@@ -184,6 +197,9 @@ def generate_pose_assets(
     bone: bpy.types.PoseBone,
     base_name: str,
 ):
+    gp_data = cast(bpy.types.GreasePencil, gp_obj.data)
+    armature_data = cast(bpy.types.Armature, armature.data)
+
     # add keyframe to frame property so that poselib picks it up
     # when creating a new pose asset
     should_insert_keyframe = True
@@ -203,10 +219,10 @@ def generate_pose_assets(
     # gather temp_context variables
     window: bpy.types.Window = bpy.context.window
     screen = window.screen
-    area = next((a for a in screen.areas if a.type == "VIEW_3D"))
-    region = next((r for r in area.regions if r.type == "WINDOW"))
+    area = next(a for a in screen.areas if a.type == "VIEW_3D")
+    region = next(r for r in area.regions if r.type == "WINDOW")
     space = area.spaces.active
-    assert isinstance(space, bpy.types.SpaceView3D)
+    assert isinstance(space, bpy.types.SpaceView3D) and space.region_3d
     original_view_persp = space.region_3d.view_perspective
 
     # set up pose asset preview camera
@@ -220,7 +236,7 @@ def generate_pose_assets(
     context.scene.camera = cam_obj
 
     # hide all gp layers except the ones we're focusing on
-    original_hide_state = hide_all_gp_layers_except(gp_obj.data, tree_node)
+    original_hide_state = hide_all_gp_layers_except(gp_data, tree_node)
     # save selections and mode to restore later
     vl: bpy.types.ViewLayer = context.view_layer
     original_mode = context.mode
@@ -233,7 +249,7 @@ def generate_pose_assets(
     # select only the chosen bone
     bpy.ops.pose.select_all(action="DESELECT")
     bone.select = True
-    armature.data.bones.active = bone.bone
+    armature_data.bones.active = bone.bone
 
     # delete existing pose assets
     prefix = asset_name_prefix(base_name)
@@ -256,7 +272,7 @@ def generate_pose_assets(
         select_only(gp_obj, vl)
         with context.temp_override(
             window=window, area=area, region=region, screen=screen
-        ):
+        ):  # type: ignore
             # view perspective cannot be camera or camera_to_view poll will fail
             space.region_3d.view_perspective = "ORTHO"
             bpy.ops.view3d.camera_to_view()
@@ -277,8 +293,8 @@ def generate_pose_assets(
     bpy.ops.object.mode_set(mode="OBJECT")
     restore_object_selection(vl, obj_selection_state)
     if original_mode != "OBJECT":
-        bpy.ops.object.mode_set(mode=context_mode_to_object_mode(original_mode))
-    restore_gp_layers(gp_obj.data, original_hide_state)
+        bpy.ops.object.mode_set(mode=context_mode_to_object_mode(original_mode))  # type: ignore
+    restore_gp_layers(gp_data, original_hide_state)
 
     # restore previous active camera and remove our preview camera
     context.scene.camera = old_active_camera
@@ -294,7 +310,7 @@ def generate_pose_assets(
 
 
 def multiline_label(layout: bpy.types.UILayout, text: list[str], icon="STATUS_WARNING"):
-    layout.label(text=text[0], icon=icon)
+    layout.label(text=text[0], icon=icon)  # type: ignore
     for line in text[1:]:
         layout.label(text=line, icon="BLANK1")
 
@@ -306,7 +322,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
 
     bl_idname = "flashy.setup_frame_picker"
     bl_label = "Set Up Frame Picker"
-    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}  # noqa: RUF012
 
     armature: bpy.props.StringProperty(
         name="Armature",
@@ -326,22 +342,23 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
     )
 
     @classmethod
-    def poll(cls, context):
+    def poll(cls, context: bpy.types.Context):
         return (
             "GREASE_PENCIL" in context.mode or context.mode == "OBJECT"
         ) and get_active_grease_pencil_tree_node(context) is not None
 
-    def draw(self, context):
+    def draw(self, context: bpy.types.Context):
         layout = self.layout
+        assert layout
 
-        armature: bpy.types.Object = None
+        armature: bpy.types.Object | None = None
         if self.armature and self.armature in bpy.data.objects:
             armature = bpy.data.objects[self.armature]
         armature_is_valid = armature is not None and armature.type == "ARMATURE"
 
         tree_node = get_active_grease_pencil_tree_node(context)
-        assert tree_node is not None
         gp_obj = context.active_object
+        assert tree_node is not None and gp_obj is not None
         mod = get_modifier_if_exists(gp_obj, tree_node)
 
         if mod is not None:
@@ -350,6 +367,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
             )
             driver = get_driver_if_exists(gp_obj, mod.name)
             if driver is not None and armature_is_valid and self.bone:
+                armature = cast(bpy.types.Object, armature)
                 prop_data_path = frame_picker_data_path(self.bone)
                 if should_keep_driver(driver, armature, prop_data_path):
                     layout.label(
@@ -373,7 +391,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
         else:
             layout.prop_search(self, "bone", armature.pose, "bones")
 
-            if self.bone and self.bone in armature.pose.bones:
+            if self.bone and armature.pose and self.bone in armature.pose.bones:
                 bone: bpy.types.PoseBone = armature.pose.bones[self.bone]
                 if FP_PROP_NAME in bone:
                     if type(bone[FP_PROP_NAME]) is int:
@@ -422,7 +440,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
                     text="Base name must be specified", icon="STATUS_ERROR_FILLED"
                 )
 
-    def execute(self, context):
+    def execute(self, context: bpy.types.Context):
         if not self.armature or not self.bone:
             self.report({"ERROR"}, "Please select both an armature and a bone")
             return {"CANCELLED"}
@@ -432,12 +450,15 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
 
         try:
             armature: bpy.types.Object = bpy.data.objects[self.armature]
+            assert armature.pose
             bone: bpy.types.PoseBone = armature.pose.bones[self.bone]
-        except KeyError:
+        except (KeyError, AssertionError):
             self.report({"ERROR"}, "Armature/bone could not be found")
             return {"CANCELLED"}
 
         tree_node = get_active_grease_pencil_tree_node(context)
+        assert tree_node and context.active_object
+        gp_obj = context.active_object
 
         # add custom prop to chosen bone, if not already present.
         # save old value to restore at the end
@@ -449,7 +470,6 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
         bone.property_overridable_library_set(f'["{FP_PROP_NAME}"]', True)
 
         # add time offset modifier, if not already present
-        gp_obj = context.active_object
         mod = get_modifier_if_exists(gp_obj, tree_node)
         if mod is None:
             # modifier name will be used to suggest a base_name value
@@ -458,10 +478,11 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
                 mod_name_suffix = self.base_name
             else:
                 mod_name_suffix = tree_node.name
-            mod: bpy.types.GreasePencilTimeModifier = (
+            mod = cast(
+                bpy.types.GreasePencilTimeModifier,
                 context.active_object.modifiers.new(
                     "TimeOffset_" + mod_name_suffix, "GREASE_PENCIL_TIME"
-                )
+                ),
             )
             mod.mode = "FIX"
             mod.use_layer_group_filter = isinstance(
@@ -471,9 +492,9 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
 
         # create/replace the driver, if needed
         prop_data_path = frame_picker_data_path(bone.name)
-        driver = get_driver_if_exists(gp_obj, mod.name)
-        if driver is not None:
-            if should_keep_driver(driver, armature, prop_data_path):
+        fcurve = get_driver_if_exists(gp_obj, mod.name)
+        if fcurve is not None:
+            if should_keep_driver(fcurve, armature, prop_data_path):
                 should_create_driver = False
             else:
                 mod.driver_remove("offset")
@@ -481,7 +502,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
         else:
             should_create_driver = True
         if should_create_driver:
-            driver = mod.driver_add("offset").driver
+            driver = cast(bpy.types.Driver, mod.driver_add("offset"))
             driver.type = "SCRIPTED"
             var = driver.variables.new()
             var.name = "fr"
@@ -511,7 +532,7 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
         self.report({"INFO"}, f"Successfully set up frame picker for {tree_node.name}")
         return {"FINISHED"}
 
-    def invoke(self, context, event):
+    def invoke(self, context: bpy.types.Context, event):
         return context.window_manager.invoke_props_dialog(self)
 
 
@@ -525,17 +546,19 @@ class FLASHY_PT_frame_picker(bpy.types.Panel):
     bl_region_type = "UI"
 
     @classmethod
-    def poll(cls, context):
+    def poll(cls, context: bpy.types.Context):
         return "GREASE_PENCIL" in context.mode or context.mode == "OBJECT"
 
-    def draw(self, context):
+    def draw(self, context: bpy.types.Context):
         layout = self.layout
+        assert layout
 
         tree_node = get_active_grease_pencil_tree_node(context)
 
         if tree_node is None:
             layout.label(text="No Grease Pencil object selected")
             return
+        assert context.active_object
 
         gp_obj = context.active_object
         mod = get_modifier_if_exists(gp_obj, tree_node)
@@ -559,6 +582,7 @@ class FLASHY_PT_frame_picker(bpy.types.Panel):
             )
             op.base_name = tree_node.name
         else:
+            assert armature_obj and isinstance(mod, bpy.types.GreasePencilTimeModifier)
             layout.separator(type="LINE")
             layout.label(text="Frame Picker Location:")
             layout.label(text=armature_obj.name, icon="OUTLINER_OB_ARMATURE")
