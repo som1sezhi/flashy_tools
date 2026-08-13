@@ -15,12 +15,11 @@ from .thorvg import (
     PaintNode,
     ShapeNode,
     StrokeColor,
-    debug_print,
     open_svg,
 )
 
 
-def create_layers(
+def _create_layers(
     gp: bpy.types.GreasePencil,
     node: GroupNode,
     parent_group: bpy.types.GreasePencilLayerGroup | None,
@@ -49,7 +48,7 @@ def create_layers(
             # last group and this one
             if shape_nodes:
                 _add_shape_layer()
-            nodes_to_layers.update(create_layers(gp, child, gp_group))
+            nodes_to_layers.update(_create_layers(gp, child, gp_group))
         else:
             shape_nodes.append(child)
 
@@ -67,7 +66,7 @@ class StrokeData:
     cyclic: bool
 
 
-def path_to_stroke_data(
+def _path_to_stroke_data(
     shape: ShapeNode,
 ) -> list[StrokeData]:
     points = [np.array([p[0], 0.0, p[1]], dtype=np.float32) for p in shape.path_pts]
@@ -201,7 +200,7 @@ class LayerBuilder:
         drawing.tag_positions_changed()
 
 
-def create_geometry_and_materials(
+def _create_geometry_and_materials(
     gp: bpy.types.GreasePencil,
     root_node: PaintNode,
     nodes_to_layers: Mapping[int, bpy.types.GreasePencilLayer],
@@ -249,7 +248,7 @@ def create_geometry_and_materials(
             for child in node.children:
                 _recurse(child)
         elif isinstance(node, ShapeNode):
-            strokes = path_to_stroke_data(node)
+            strokes = _path_to_stroke_data(node)
             if not strokes:
                 transform_stack.pop()
                 return  # for safety (otherwise add_strokes will crash)
@@ -305,14 +304,14 @@ def create_geometry_and_materials(
         builder.build()
 
 
-def paint_to_gp(node: PaintNode, name: str, scale: float) -> bpy.types.GreasePencil:
+def _paint_to_gp(node: PaintNode, name: str, scale: float) -> bpy.types.GreasePencil:
     gp = bpy.data.grease_pencils.new(name)
     if isinstance(node, GroupNode):
-        nodes_to_layers = create_layers(gp, node, None)
+        nodes_to_layers = _create_layers(gp, node, None)
     else:
         layer = gp.layers.new(node.name or "Layer")
         nodes_to_layers = {node.addr: layer}
-    create_geometry_and_materials(gp, node, nodes_to_layers, scale)
+    _create_geometry_and_materials(gp, node, nodes_to_layers, scale)
     return gp
 
 
@@ -347,7 +346,7 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
         print("parse", parse_end - start)
 
         obj_name = os.path.basename(path)
-        gp = paint_to_gp(node, obj_name, cast(float, self.scale))
+        gp = _paint_to_gp(node, obj_name, cast(float, self.scale))
         gp_end = time.time()
         print("gp", gp_end - parse_end)
 
