@@ -1,7 +1,7 @@
 import os
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast
 
 import bpy
@@ -15,18 +15,50 @@ from .thorvg import (
     PaintNode,
     ShapeNode,
     StrokeColor,
+    # debug_print,
     open_svg,
 )
 
 
 def _create_layers(
     gp: bpy.types.GreasePencil,
+    node: PaintNode,
+    parent_group: bpy.types.GreasePencilLayerGroup | None,
+) -> dict[int, bpy.types.GreasePencilLayer]:
+    if isinstance(node, GroupNode):
+        return _create_layers_from_group_node(gp, node, parent_group, [])
+    elif isinstance(node, ShapeNode):
+        layer = gp.layers.new(node.name or "Layer", layer_group=parent_group)
+        nodes_to_layers = {node.addr: layer}
+        if node.mask:
+            mask_nodes_to_layers = _create_mask_layers(gp, node.mask)
+            nodes_to_layers.update(mask_nodes_to_layers)
+        return nodes_to_layers
+    return {}  # other types of node are unsupported
+
+
+def _create_mask_layers(gp: bpy.types.GreasePencil, mask_node: PaintNode):
+    mask_nodes_to_layers = _create_layers(gp, mask_node, None)
+    for mask_layer in mask_nodes_to_layers.values():
+        mask_layer.opacity = 0.0
+    return mask_nodes_to_layers
+
+
+def _create_layers_from_group_node(
+    gp: bpy.types.GreasePencil,
     node: GroupNode,
     parent_group: bpy.types.GreasePencilLayerGroup | None,
+    mask_layers: list[bpy.types.GreasePencilLayer],
 ) -> dict[int, bpy.types.GreasePencilLayer]:
     name = node.name or "Group"
     gp_group = gp.layer_groups.new(name, parent_group=parent_group)
     nodes_to_layers: dict[int, bpy.types.GreasePencilLayer] = {}
+
+    if node.mask:
+        mask_nodes_to_layers = _create_mask_layers(gp, node.mask)
+        nodes_to_layers.update(mask_nodes_to_layers)
+        # TODO: is this the correct way to combine masks?
+        mask_layers = mask_layers + list(mask_nodes_to_layers.values())
 
     shape_nodes: list[PaintNode] = []
     n_shape_layers = 0
@@ -42,16 +74,24 @@ def _create_layers(
             nodes_to_layers[shape.addr] = shape_layer
         shape_nodes.clear()
 
+        if mask_layers:
+            shape_layer.use_masks = True
+            for mask_layer in mask_layers:
+                shape_layer.mask_layers.add(mask_layer)
+
     for child in node.children:
         if isinstance(child, GroupNode):
             # emit a layer for the shape nodes between the
             # last group and this one
             if shape_nodes:
                 _add_shape_layer()
-            nodes_to_layers.update(_create_layers(gp, child, gp_group))
-        else:
+            child_nodes_to_layers = _create_layers_from_group_node(
+                gp, child, gp_group, mask_layers
+            )
+            nodes_to_layers.update(child_nodes_to_layers)
+        elif isinstance(child, ShapeNode):
             shape_nodes.append(child)
-
+    # emit layer for remaining shape nodes
     if shape_nodes:
         _add_shape_layer()
 
@@ -200,117 +240,169 @@ class LayerBuilder:
         drawing.tag_positions_changed()
 
 
+@dataclass
+class BuildContext:
+    # inputs
+    gp: bpy.types.GreasePencil
+    nodes_to_layers: Mapping[int, bpy.types.GreasePencilLayer]
+    scale: float
+    scale_mat: np.ndarray
+    is_mask: bool
+
+    # state
+    material_idxs: dict[tuple[StrokeColor, FillColor], int]
+    mask_material_idx: int | None
+    transform_stack: list[np.ndarray]
+    cur_fill_id: int
+
+    # outputs
+    layer_to_builder: dict[str, LayerBuilder]
+
+
+def _get_material(
+    ctx: BuildContext, stroke_color: StrokeColor, fill_color: FillColor
+) -> int:
+    key = (stroke_color, fill_color)
+    if key in ctx.material_idxs:
+        return ctx.material_idxs[key]
+
+    material = bpy.data.materials.new(ctx.gp.name + "_Material")
+    bpy.data.materials.create_gpencil_data(material)
+    ctx.gp.materials.append(material)
+    idx = len(ctx.gp.materials) - 1
+    ctx.material_idxs[key] = idx
+
+    assert material.grease_pencil
+    material.grease_pencil.fill_color = _srgb_to_linear(fill_color)  # type: ignore
+    if stroke_color:
+        material.grease_pencil.color = _srgb_to_linear(stroke_color)  # type: ignore
+    else:
+        material.grease_pencil.color = (0, 0, 0, 0)  # type: ignore
+
+    return idx
+
+
+def _get_mask_material(ctx: BuildContext) -> int:
+    if ctx.mask_material_idx is not None:
+        return ctx.mask_material_idx
+
+    material = bpy.data.materials.new(ctx.gp.name + "_MaskMaterial")
+    bpy.data.materials.create_gpencil_data(material)
+    ctx.gp.materials.append(material)
+    idx = len(ctx.gp.materials) - 1
+    ctx.mask_material_idx = idx
+
+    assert material.grease_pencil
+    material.grease_pencil.fill_color = (1, 1, 1, 1)  # type: ignore
+    material.grease_pencil.color = (1, 1, 1, 1)  # type: ignore
+
+    return idx
+
+
+def _apply_transform(transform: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """Given a transform (shape (4, 4)) and an array of positions (shape (N, 3)),
+    return an array of transformed positions (shape (N, 3))."""
+    x = np.pad(x, [(0, 0), (0, 1)], constant_values=1)[..., np.newaxis]
+    return (transform @ x)[..., :3, 0]
+
+
+def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
+    transform = _expand_to_4x4(node.transform)
+    transform = transform @ ctx.transform_stack[-1]
+    ctx.transform_stack.append(transform)
+    transform = ctx.scale_mat @ transform
+
+    if node.mask:
+        # TODO: do we need to reset the transform stack when building the mask?
+        _gather_geometry_and_materials_data(replace(ctx, is_mask=True), node.mask)
+
+    if isinstance(node, GroupNode):
+        for child in node.children:
+            _gather_geometry_and_materials_data(ctx, child)
+    elif isinstance(node, ShapeNode):
+        strokes = _path_to_stroke_data(node)
+        if not strokes:
+            ctx.transform_stack.pop()
+            return  # for safety (otherwise add_strokes will crash)
+
+        layer = ctx.nodes_to_layers[node.addr]
+        if layer.name not in ctx.layer_to_builder:
+            ctx.layer_to_builder[layer.name] = LayerBuilder(layer)
+        builder = ctx.layer_to_builder[layer.name]
+
+        builder.add_stroke_lengths([len(s.position) for s in strokes])
+
+        if ctx.is_mask:
+            mat_idx = _get_mask_material(ctx)
+        else:
+            mat_idx = _get_material(ctx, node.stroke_color, node.fill_color)
+        no_stroke = node.stroke_color is None
+
+        # curve-domain attributes
+        # curve_type = np.full((len(strokes),), 2, dtype=np.int8)  # 2 => bezier
+        cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
+        fill_id = np.full((len(strokes),), ctx.cur_fill_id, dtype=np.int32)
+        material_index = np.full((len(strokes),), mat_idx, dtype=np.int32)
+        hide_stroke = np.full((len(strokes),), no_stroke, dtype=np.bool)
+        ctx.cur_fill_id += 1
+        # builder.append_to_attr("curve_type", "INT8", "CURVE", curve_type)
+        builder.append_to_attr("cyclic", "BOOLEAN", "CURVE", cyclic)
+        builder.append_to_attr("fill_id", "INT", "CURVE", fill_id)
+        builder.append_to_attr("material_index", "INT", "CURVE", material_index)
+        builder.append_to_attr("hide_stroke", "BOOLEAN", "CURVE", hide_stroke)
+
+        # point-domain attributes
+        position = _apply_transform(transform, np.vstack([s.position for s in strokes]))
+        handle_left = _apply_transform(
+            transform, np.vstack([s.handle_left for s in strokes])
+        )
+        handle_right = _apply_transform(
+            transform, np.vstack([s.handle_right for s in strokes])
+        )
+        handle_type = np.full((len(position),), 0, dtype=np.int8)  # 0 => free
+        radius = np.full(
+            (len(position),), node.stroke_width * ctx.scale * 0.5, dtype=np.float32
+        )
+        builder.append_to_attr("position", "FLOAT_VECTOR", "POINT", position)
+        builder.append_to_attr("handle_left", "FLOAT_VECTOR", "POINT", handle_left)
+        builder.append_to_attr("handle_right", "FLOAT_VECTOR", "POINT", handle_right)
+        builder.append_to_attr("handle_type_left", "INT8", "POINT", handle_type)
+        builder.append_to_attr("handle_type_right", "INT8", "POINT", handle_type)
+        builder.append_to_attr("radius", "FLOAT", "POINT", radius)
+
+    ctx.transform_stack.pop()
+
+
 def _create_geometry_and_materials(
     gp: bpy.types.GreasePencil,
     root_node: PaintNode,
     nodes_to_layers: Mapping[int, bpy.types.GreasePencilLayer],
     scale: float,
 ):
-    cur_fill_id = 1
     # negate Z to flip Z-down convention to Z-up
     scale_mat = np.diag([scale, scale, -scale, 1.0])
 
-    material_idxs: dict[tuple[StrokeColor, FillColor], int] = {}
-    transform_stack = [np.identity(4, dtype=np.float32)]
-    layer_to_builder: dict[str, LayerBuilder] = {}
+    ctx = BuildContext(
+        gp=gp,
+        nodes_to_layers=nodes_to_layers,
+        scale=scale,
+        scale_mat=scale_mat,
+        is_mask=False,
+        material_idxs={},
+        mask_material_idx=None,
+        transform_stack=[np.identity(4, dtype=np.float32)],
+        cur_fill_id=1,
+        layer_to_builder={},
+    )
+    _gather_geometry_and_materials_data(ctx, root_node)
 
-    def _get_material(stroke_color: StrokeColor, fill_color: FillColor) -> int:
-        key = (stroke_color, fill_color)
-        if key in material_idxs:
-            return material_idxs[key]
-
-        material = bpy.data.materials.new(gp.name + "_Material")
-        bpy.data.materials.create_gpencil_data(material)
-        gp.materials.append(material)
-        idx = len(gp.materials) - 1
-        material_idxs[key] = idx
-
-        assert material.grease_pencil
-        material.grease_pencil.fill_color = _srgb_to_linear(fill_color)  # type: ignore
-        if stroke_color:
-            material.grease_pencil.color = _srgb_to_linear(stroke_color)  # type: ignore
-        else:
-            material.grease_pencil.color = (0, 0, 0, 0)  # type: ignore
-
-        return idx
-
-    def _apply_transform(transform: np.ndarray, x: np.ndarray) -> np.ndarray:
-        x = np.pad(x, [(0, 0), (0, 1)], constant_values=1)[..., np.newaxis]
-        return (transform @ x)[..., :3, 0]
-
-    def _recurse(node: PaintNode):
-        transform = _expand_to_4x4(node.transform)
-        transform = transform @ transform_stack[-1]
-        transform_stack.append(transform)
-        transform = scale_mat @ transform
-
-        if isinstance(node, GroupNode):
-            for child in node.children:
-                _recurse(child)
-        elif isinstance(node, ShapeNode):
-            strokes = _path_to_stroke_data(node)
-            if not strokes:
-                transform_stack.pop()
-                return  # for safety (otherwise add_strokes will crash)
-            layer = nodes_to_layers[node.addr]
-            if layer.name not in layer_to_builder:
-                layer_to_builder[layer.name] = LayerBuilder(layer)
-            builder = layer_to_builder[layer.name]
-
-            builder.add_stroke_lengths([len(s.position) for s in strokes])
-
-            mat_idx = _get_material(node.stroke_color, node.fill_color)
-
-            # curve-domain attributes
-            nonlocal cur_fill_id
-            # curve_type = np.full((len(strokes),), 2, dtype=np.int8)  # 2 => bezier
-            cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
-            fill_id = np.full((len(strokes),), cur_fill_id, dtype=np.int32)
-            material_index = np.full((len(strokes),), mat_idx, dtype=np.int32)
-            cur_fill_id += 1
-            # builder.append_to_attr("curve_type", "INT8", "CURVE", curve_type)
-            builder.append_to_attr("cyclic", "BOOLEAN", "CURVE", cyclic)
-            builder.append_to_attr("fill_id", "INT", "CURVE", fill_id)
-            builder.append_to_attr("material_index", "INT", "CURVE", material_index)
-
-            # point-domain attributes
-            position = _apply_transform(
-                transform, np.vstack([s.position for s in strokes])
-            )
-            handle_left = _apply_transform(
-                transform, np.vstack([s.handle_left for s in strokes])
-            )
-            handle_right = _apply_transform(
-                transform, np.vstack([s.handle_right for s in strokes])
-            )
-            handle_type = np.full((len(position),), 0, dtype=np.int8)  # 0 => free
-            radius = np.full(
-                (len(position),), node.stroke_width * scale * 0.5, dtype=np.float32
-            )
-            builder.append_to_attr("position", "FLOAT_VECTOR", "POINT", position)
-            builder.append_to_attr("handle_left", "FLOAT_VECTOR", "POINT", handle_left)
-            builder.append_to_attr(
-                "handle_right", "FLOAT_VECTOR", "POINT", handle_right
-            )
-            builder.append_to_attr("handle_type_left", "INT8", "POINT", handle_type)
-            builder.append_to_attr("handle_type_right", "INT8", "POINT", handle_type)
-            builder.append_to_attr("radius", "FLOAT", "POINT", radius)
-
-        transform_stack.pop()
-
-    _recurse(root_node)
-
-    for builder in layer_to_builder.values():
+    for builder in ctx.layer_to_builder.values():
         builder.build()
 
 
 def _paint_to_gp(node: PaintNode, name: str, scale: float) -> bpy.types.GreasePencil:
     gp = bpy.data.grease_pencils.new(name)
-    if isinstance(node, GroupNode):
-        nodes_to_layers = _create_layers(gp, node, None)
-    else:
-        layer = gp.layers.new(node.name or "Layer")
-        nodes_to_layers = {node.addr: layer}
+    nodes_to_layers = _create_layers(gp, node, None)
     _create_geometry_and_materials(gp, node, nodes_to_layers, scale)
     return gp
 
