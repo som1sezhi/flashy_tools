@@ -218,7 +218,8 @@ def _extract_data(pic: tvg.Picture) -> PaintNode:
         # get_id() gives 0
         paint = _ptr_to_paint_obj(engine, ptr)
         paint_id = paint.get_id()
-        id_to_names[paint_id] = accessor.accessor_get_name(paint_id)
+        if paint_id:
+            id_to_names[paint_id] = accessor.accessor_get_name(paint_id)
         return True
 
     pic.set_accessible(True)

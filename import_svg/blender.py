@@ -15,30 +15,83 @@ from .thorvg import (
     PaintNode,
     ShapeNode,
     StrokeColor,
-    # debug_print,
+    debug_print,
     open_svg,
 )
+
+
+def _simplify_nodes(node: PaintNode):
+    if not isinstance(node, GroupNode):
+        return
+
+    for child in node.children:
+        _simplify_nodes(child)
+
+    if node.mask:
+        _simplify_nodes(node.mask)
+        if isinstance(node.mask, GroupNode):
+            if len(node.mask.children) == 0:
+                node.mask = None
+            elif len(node.mask.children) == 1:
+                node.mask = node.mask.children[0]
+
+    i = 0
+    while i < len(node.children):
+        child = node.children[i]
+        if (
+            isinstance(child, GroupNode)
+            and not any(isinstance(c, GroupNode) for c in child.children)
+            and (
+                # child is a candidate for compaction.
+                # check if there aren't any conflicting masks
+                not child.mask or all(not c.mask for c in child.children)
+            )
+        ):
+            # prepare compaction
+            for c in child.children:
+                c.transform = child.transform @ c.transform
+            if child.mask:
+                for c in child.children:
+                    c.mask = child.mask
+                    c.mask_method = child.mask_method
+            # pass along name if this group is the only child
+            if not node.name and child.name and len(node.children) == 1:
+                node.name = child.name
+            # do compaction
+            node.children[i : i + 1] = child.children
+            i += len(child.children)
+        else:
+            i += 1
 
 
 def _create_layers(
     gp: bpy.types.GreasePencil,
     node: PaintNode,
     parent_group: bpy.types.GreasePencilLayerGroup | None,
+    mask_layers: list[bpy.types.GreasePencilLayer],
 ) -> dict[int, bpy.types.GreasePencilLayer]:
     if isinstance(node, GroupNode):
         return _create_layers_from_group_node(gp, node, parent_group, [])
     elif isinstance(node, ShapeNode):
         layer = gp.layers.new(node.name or "Layer", layer_group=parent_group)
+        layer.frames.new(1)
         nodes_to_layers = {node.addr: layer}
+
         if node.mask:
             mask_nodes_to_layers = _create_mask_layers(gp, node.mask)
             nodes_to_layers.update(mask_nodes_to_layers)
+            mask_layers = mask_layers + list(mask_nodes_to_layers.values())
+        if mask_layers:
+            layer.use_masks = True
+            for mask_layer in mask_layers:
+                layer.mask_layers.add(mask_layer)
+
         return nodes_to_layers
     return {}  # other types of node are unsupported
 
 
 def _create_mask_layers(gp: bpy.types.GreasePencil, mask_node: PaintNode):
-    mask_nodes_to_layers = _create_layers(gp, mask_node, None)
+    mask_nodes_to_layers = _create_layers(gp, mask_node, None, [])
     for mask_layer in mask_nodes_to_layers.values():
         mask_layer.opacity = 0.0
     return mask_nodes_to_layers
@@ -66,18 +119,14 @@ def _create_layers_from_group_node(
     def _add_shape_layer():
         nonlocal n_shape_layers
         n_shape_layers += 1
-        shape_layer = gp.layers.new(
-            f"{gp_group.name}_Shapes_{n_shape_layers}", layer_group=gp_group
-        )
-        shape_layer.frames.new(1)
-        for shape in shape_nodes:
+        n2l = _create_layers(gp, shape_nodes[-1], gp_group, mask_layers)
+        shape_layer = n2l[shape_nodes[-1].addr]
+        shape_layer.name = f"{gp_group.name}_Shapes_{n_shape_layers}"
+
+        nodes_to_layers.update(n2l)
+        for shape in shape_nodes[:-1]:
             nodes_to_layers[shape.addr] = shape_layer
         shape_nodes.clear()
-
-        if mask_layers:
-            shape_layer.use_masks = True
-            for mask_layer in mask_layers:
-                shape_layer.mask_layers.add(mask_layer)
 
     for child in node.children:
         if isinstance(child, GroupNode):
@@ -90,6 +139,12 @@ def _create_layers_from_group_node(
             )
             nodes_to_layers.update(child_nodes_to_layers)
         elif isinstance(child, ShapeNode):
+            if shape_nodes:
+                prev_shape = shape_nodes[-1]
+                prev_mask_addr = prev_shape.mask.addr if prev_shape.mask else None
+                cur_mask_addr = child.mask.addr if child.mask else None
+                if prev_mask_addr != cur_mask_addr:
+                    _add_shape_layer()
             shape_nodes.append(child)
     # emit layer for remaining shape nodes
     if shape_nodes:
@@ -254,6 +309,7 @@ class BuildContext:
     mask_material_idx: int | None
     transform_stack: list[np.ndarray]
     cur_fill_id: int
+    visited: set[int]
 
     # outputs
     layer_to_builder: dict[str, LayerBuilder]
@@ -307,8 +363,12 @@ def _apply_transform(transform: np.ndarray, x: np.ndarray) -> np.ndarray:
 
 
 def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
+    if node.addr in ctx.visited:
+        return
+    ctx.visited.add(node.addr)
+
     transform = _expand_to_4x4(node.transform)
-    transform = transform @ ctx.transform_stack[-1]
+    transform = ctx.transform_stack[-1] @ transform
     ctx.transform_stack.append(transform)
     transform = ctx.scale_mat @ transform
 
@@ -392,6 +452,7 @@ def _create_geometry_and_materials(
         mask_material_idx=None,
         transform_stack=[np.identity(4, dtype=np.float32)],
         cur_fill_id=1,
+        visited=set(),
         layer_to_builder={},
     )
     _gather_geometry_and_materials_data(ctx, root_node)
@@ -402,7 +463,7 @@ def _create_geometry_and_materials(
 
 def _paint_to_gp(node: PaintNode, name: str, scale: float) -> bpy.types.GreasePencil:
     gp = bpy.data.grease_pencils.new(name)
-    nodes_to_layers = _create_layers(gp, node, None)
+    nodes_to_layers = _create_layers(gp, node, None, [])
     _create_geometry_and_materials(gp, node, nodes_to_layers, scale)
     return gp
 
@@ -437,6 +498,9 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
         parse_end = time.time()
         print("parse", parse_end - start)
 
+        # print("================")
+        _simplify_nodes(node)
+        # debug_print(node)
         obj_name = os.path.basename(path)
         gp = _paint_to_gp(node, obj_name, cast(float, self.scale))
         gp_end = time.time()
