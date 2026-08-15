@@ -1,3 +1,4 @@
+import math
 import os
 import time
 from collections.abc import Mapping
@@ -7,7 +8,7 @@ from typing import Literal, cast
 import bpy
 import numpy as np
 from bpy_extras.io_utils import ImportHelper
-from thorvg_python import PathCommand
+from thorvg_python import PathCommand, StrokeCap, StrokeJoin
 
 from ..utils import select_only
 from .thorvg import (
@@ -273,26 +274,50 @@ def _srgb_to_linear(col: tuple[float, float, float, float]):
     )
 
 
+DomainType = Literal["CURVE", "POINT"]
+
+
 class LayerBuilder:
     def __init__(self, layer: bpy.types.GreasePencilLayer):
         self.layer = layer
         self.stroke_lengths: list[int] = []
         # maps name to (type, domain)
-        self.attrs: dict[str, tuple[str, str]] = {}
+        self.attrs: dict[str, tuple[str, DomainType]] = {}
         # maps name to data
         self.data: dict[str, np.ndarray] = {}
 
     def add_stroke_lengths(self, lengths: list[int]):
         self.stroke_lengths.extend(lengths)
 
-    def append_to_attr(self, name: str, data_type: str, domain: str, data: np.ndarray):
-        if name in self.attrs:
-            self.data[name] = np.concat([self.data[name], data], axis=0)
-        else:
+    def _extend_attr_data(self, name: str, incoming_data_len: int):
+        data_type, domain = self.attrs[name]
+        if domain == "CURVE":
+            wanted_len = len(self.stroke_lengths)
+        else:  # domain == "POINT"
+            wanted_len = sum(self.stroke_lengths)
+        pad_len = wanted_len - incoming_data_len - len(self.data[name])
+        if pad_len > 0:
+            pad = [(0, pad_len)]
+            if data_type == "FLOAT_VECTOR":
+                pad.append((0, 0))
+            self.data[name] = np.pad(self.data[name], pad)
+
+    def append_to_attr(
+        self, name: str, data_type: str, domain: DomainType, data: np.ndarray
+    ):
+        if name not in self.attrs:
             self.attrs[name] = (data_type, domain)
-            self.data[name] = data
+            if data_type == "FLOAT_VECTOR":
+                self.data[name] = np.array([], dtype=data.dtype).reshape((0, 3))
+            else:
+                self.data[name] = np.array([], dtype=data.dtype)
+        self._extend_attr_data(name, len(data))
+        self.data[name] = np.concat([self.data[name], data], axis=0)
 
     def build(self):
+        for name in self.attrs:
+            self._extend_attr_data(name, 0)
+
         assert len(self.layer.frames) > 0 and self.layer.frames[0].drawing
         drawing = self.layer.frames[0].drawing
         attributes = drawing.attributes
@@ -383,10 +408,8 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
         return
 
     if node.mask:
-        # TODO: do we need to reset the transform stack when building the mask?
         _gather_geometry_and_materials_data(replace(ctx, is_mask=True), node.mask)
     if node.clip:
-        # TODO: do we need to reset the transform stack when building the clip?
         _gather_geometry_and_materials_data(replace(ctx, is_clip=True), node.clip)
 
     if isinstance(node, GroupNode):
@@ -412,17 +435,21 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
         no_stroke = node.stroke_color is None or ctx.is_clip
 
         # curve-domain attributes
-        # curve_type = np.full((len(strokes),), 2, dtype=np.int8)  # 2 => bezier
         cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
         fill_id = np.full((len(strokes),), ctx.cur_fill_id, dtype=np.int32)
         material_index = np.full((len(strokes),), mat_idx, dtype=np.int32)
-        hide_stroke = np.full((len(strokes),), no_stroke, dtype=np.bool)
         ctx.cur_fill_id += 1
-        # builder.append_to_attr("curve_type", "INT8", "CURVE", curve_type)
         builder.append_to_attr("cyclic", "BOOLEAN", "CURVE", cyclic)
         builder.append_to_attr("fill_id", "INT", "CURVE", fill_id)
         builder.append_to_attr("material_index", "INT", "CURVE", material_index)
-        builder.append_to_attr("hide_stroke", "BOOLEAN", "CURVE", hide_stroke)
+        if no_stroke:
+            hide_stroke = np.full((len(strokes),), no_stroke, dtype=np.bool)
+            builder.append_to_attr("hide_stroke", "BOOLEAN", "CURVE", hide_stroke)
+        if node.stroke_cap != StrokeCap.ROUND:
+            # TODO: proper square cap support? (maybe by adding new points at the ends)
+            cap = np.full((len(strokes),), 1, dtype=np.int8)  # 0 => flat
+            builder.append_to_attr("start_cap", "INT8", "CURVE", cap)
+            builder.append_to_attr("end_cap", "INT8", "CURVE", cap)
 
         # point-domain attributes
         position = ctx.scale_vec * np.vstack([s.position for s in strokes])
@@ -438,6 +465,22 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
         builder.append_to_attr("handle_type_left", "INT8", "POINT", handle_type)
         builder.append_to_attr("handle_type_right", "INT8", "POINT", handle_type)
         builder.append_to_attr("radius", "FLOAT", "POINT", radius)
+        if node.stroke_join != StrokeJoin.ROUND:
+            if node.stroke_join == StrokeJoin.MITER:
+                # thanks mdn
+                angle = 2 * math.asin(1 / node.stroke_miterlimit)
+                # NOTE: currently, blender rounds miter angles to nearest pi/62
+                # during the packing process:
+                # https://projects.blender.org/blender/blender/src/commit/4d6a448ec8e203a080b276c34ae73fb91078d088/source/blender/draw/intern/draw_cache_impl_grease_pencil.cc#L264
+                # this can cause some points close to the miter angle to have
+                # incorrect miter cutoff status.
+                # err on the side of keeping the miter, so the user can fix it
+                # themselves if needed by setting corner type to Flat
+                angle = math.floor(angle / math.pi * 62) / 62 * math.pi
+            else:  # node.stroke_join == StrokeJoin.BEVEL
+                angle = 3.142
+            miter_angle = np.full((len(position),), angle, dtype=np.float32)
+            builder.append_to_attr("miter_angle", "FLOAT", "POINT", miter_angle)
 
 
 def _create_geometry_and_materials(
