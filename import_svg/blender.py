@@ -2,20 +2,21 @@ import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import cast
+from typing import Literal, cast
 
 import bpy
 import numpy as np
 from bpy_extras.io_utils import ImportHelper
 from thorvg_python import PathCommand
 
+from ..utils import select_only
 from .thorvg import (
     FillColor,
     GroupNode,
     PaintNode,
     ShapeNode,
     StrokeColor,
-    debug_print,
+    # debug_print,
     open_svg,
 )
 
@@ -24,6 +25,26 @@ def _simplify_nodes(node: PaintNode):
     if not isinstance(node, GroupNode):
         return
 
+    def _has_conflicting_masks_or_clips(child: GroupNode):
+        return (child.mask is not None and any(c.mask for c in child.children)) or (
+            child.clip is not None and any(c.clip for c in child.children)
+        )
+
+    def _prepare_compaction(child: GroupNode):
+        if child.mask:
+            for c in child.children:
+                assert not c.mask
+                c.mask = child.mask
+                c.mask_method = child.mask_method
+        if child.clip:
+            for c in child.children:
+                assert not c.clip
+                c.clip = child.clip
+        # pass along name if this group is the only child
+        if not node.name and child.name and len(node.children) == 1:
+            node.name = child.name
+
+    # recursively simplify the node hierarchy
     for child in node.children:
         _simplify_nodes(child)
 
@@ -31,9 +52,24 @@ def _simplify_nodes(node: PaintNode):
         _simplify_nodes(node.mask)
         if isinstance(node.mask, GroupNode):
             if len(node.mask.children) == 0:
+                # TODO: is this correct? (is no mask equivalent to an empty mask?)
                 node.mask = None
-            elif len(node.mask.children) == 1:
+            elif len(node.mask.children) == 1 and not _has_conflicting_masks_or_clips(
+                node.mask
+            ):
+                _prepare_compaction(node.mask)
                 node.mask = node.mask.children[0]
+    if node.clip:
+        _simplify_nodes(node.clip)
+        if isinstance(node.clip, GroupNode):
+            if len(node.clip.children) == 0:
+                # TODO: is this correct? (is no clip equivalent to an empty clip?)
+                node.clip = None
+            elif len(node.clip.children) == 1 and not _has_conflicting_masks_or_clips(
+                node.clip
+            ):
+                _prepare_compaction(node.clip)
+                node.clip = node.clip.children[0]
 
     i = 0
     while i < len(node.children):
@@ -41,23 +77,9 @@ def _simplify_nodes(node: PaintNode):
         if (
             isinstance(child, GroupNode)
             and not any(isinstance(c, GroupNode) for c in child.children)
-            and (
-                # child is a candidate for compaction.
-                # check if there aren't any conflicting masks
-                not child.mask or all(not c.mask for c in child.children)
-            )
+            and not _has_conflicting_masks_or_clips(child)
         ):
-            # prepare compaction
-            for c in child.children:
-                c.transform = child.transform @ c.transform
-            if child.mask:
-                for c in child.children:
-                    c.mask = child.mask
-                    c.mask_method = child.mask_method
-            # pass along name if this group is the only child
-            if not node.name and child.name and len(node.children) == 1:
-                node.name = child.name
-            # do compaction
+            _prepare_compaction(child)
             node.children[i : i + 1] = child.children
             i += len(child.children)
         else:
@@ -69,25 +91,39 @@ def _create_layers(
     node: PaintNode,
     parent_group: bpy.types.GreasePencilLayerGroup | None,
     mask_layers: list[bpy.types.GreasePencilLayer],
-) -> dict[int, bpy.types.GreasePencilLayer]:
+) -> dict[PaintNode, bpy.types.GreasePencilLayer]:
+    if not isinstance(node, (GroupNode, ShapeNode)):
+        return {}  # we don't support other nodes yet
+
+    nodes_to_layers: dict[PaintNode, bpy.types.GreasePencilLayer] = {}
+
+    # create layers for masks and clips
+    if node.mask:
+        mask_nodes_to_layers = _create_mask_layers(gp, node.mask)
+        nodes_to_layers.update(mask_nodes_to_layers)
+        # TODO: is this the correct way to combine masks?
+        mask_layers = mask_layers + list(mask_nodes_to_layers.values())
+    if node.clip:
+        clip_nodes_to_layers = _create_mask_layers(gp, node.clip)
+        nodes_to_layers.update(clip_nodes_to_layers)
+        # TODO: is this the correct way to combine clips?
+        mask_layers = mask_layers + list(clip_nodes_to_layers.values())
+
     if isinstance(node, GroupNode):
-        return _create_layers_from_group_node(gp, node, parent_group, [])
-    elif isinstance(node, ShapeNode):
+        n2l = _create_layers_from_group_node(gp, node, parent_group, mask_layers)
+        nodes_to_layers.update(n2l)
+    else:  # isinstance(node, ShapeNode)
         layer = gp.layers.new(node.name or "Layer", layer_group=parent_group)
         layer.frames.new(1)
-        nodes_to_layers = {node.addr: layer}
+        nodes_to_layers[node] = layer
 
-        if node.mask:
-            mask_nodes_to_layers = _create_mask_layers(gp, node.mask)
-            nodes_to_layers.update(mask_nodes_to_layers)
-            mask_layers = mask_layers + list(mask_nodes_to_layers.values())
+        # set up masks in the grease pencil layer
         if mask_layers:
             layer.use_masks = True
             for mask_layer in mask_layers:
                 layer.mask_layers.add(mask_layer)
 
-        return nodes_to_layers
-    return {}  # other types of node are unsupported
+    return nodes_to_layers
 
 
 def _create_mask_layers(gp: bpy.types.GreasePencil, mask_node: PaintNode):
@@ -102,16 +138,11 @@ def _create_layers_from_group_node(
     node: GroupNode,
     parent_group: bpy.types.GreasePencilLayerGroup | None,
     mask_layers: list[bpy.types.GreasePencilLayer],
-) -> dict[int, bpy.types.GreasePencilLayer]:
+) -> dict[PaintNode, bpy.types.GreasePencilLayer]:
     name = node.name or "Group"
     gp_group = gp.layer_groups.new(name, parent_group=parent_group)
-    nodes_to_layers: dict[int, bpy.types.GreasePencilLayer] = {}
 
-    if node.mask:
-        mask_nodes_to_layers = _create_mask_layers(gp, node.mask)
-        nodes_to_layers.update(mask_nodes_to_layers)
-        # TODO: is this the correct way to combine masks?
-        mask_layers = mask_layers + list(mask_nodes_to_layers.values())
+    nodes_to_layers: dict[PaintNode, bpy.types.GreasePencilLayer] = {}
 
     shape_nodes: list[PaintNode] = []
     n_shape_layers = 0
@@ -120,12 +151,12 @@ def _create_layers_from_group_node(
         nonlocal n_shape_layers
         n_shape_layers += 1
         n2l = _create_layers(gp, shape_nodes[-1], gp_group, mask_layers)
-        shape_layer = n2l[shape_nodes[-1].addr]
+        shape_layer = n2l[shape_nodes[-1]]
         shape_layer.name = f"{gp_group.name}_Shapes_{n_shape_layers}"
 
         nodes_to_layers.update(n2l)
         for shape in shape_nodes[:-1]:
-            nodes_to_layers[shape.addr] = shape_layer
+            nodes_to_layers[shape] = shape_layer
         shape_nodes.clear()
 
     for child in node.children:
@@ -134,16 +165,15 @@ def _create_layers_from_group_node(
             # last group and this one
             if shape_nodes:
                 _add_shape_layer()
-            child_nodes_to_layers = _create_layers_from_group_node(
-                gp, child, gp_group, mask_layers
-            )
+            child_nodes_to_layers = _create_layers(gp, child, gp_group, mask_layers)
             nodes_to_layers.update(child_nodes_to_layers)
         elif isinstance(child, ShapeNode):
             if shape_nodes:
                 prev_shape = shape_nodes[-1]
-                prev_mask_addr = prev_shape.mask.addr if prev_shape.mask else None
-                cur_mask_addr = child.mask.addr if child.mask else None
-                if prev_mask_addr != cur_mask_addr:
+                # we may only collect shapes into one layer if they have the same
+                # mask/clip settings. if we detect a change in these settings,
+                # emit a layer to flush these shapes before proceeding
+                if prev_shape.mask != child.mask or prev_shape.clip != child.clip:
                     _add_shape_layer()
             shape_nodes.append(child)
     # emit layer for remaining shape nodes
@@ -164,8 +194,8 @@ class StrokeData:
 def _path_to_stroke_data(
     shape: ShapeNode,
 ) -> list[StrokeData]:
-    points = [np.array([p[0], 0.0, p[1]], dtype=np.float32) for p in shape.path_pts]
-    if not points:
+    points = np.insert(shape.path_pts, 1, 0.0, axis=1)
+    if len(points) == 0:
         return []
 
     strokes: list[StrokeData] = []
@@ -243,18 +273,6 @@ def _srgb_to_linear(col: tuple[float, float, float, float]):
     )
 
 
-def _expand_to_4x4(m: np.ndarray) -> np.ndarray:
-    return np.array(
-        [
-            [m[0][0], 0, m[0][1], m[0][2]],
-            [0, 1, 0, 0],
-            [m[1][0], 0, m[1][1], m[1][2]],
-            [m[2][0], 0, m[2][1], m[2][2]],
-        ],
-        dtype=np.float32,
-    )
-
-
 class LayerBuilder:
     def __init__(self, layer: bpy.types.GreasePencilLayer):
         self.layer = layer
@@ -299,15 +317,14 @@ class LayerBuilder:
 class BuildContext:
     # inputs
     gp: bpy.types.GreasePencil
-    nodes_to_layers: Mapping[int, bpy.types.GreasePencilLayer]
+    nodes_to_layers: Mapping[PaintNode, bpy.types.GreasePencilLayer]
     scale: float
-    scale_mat: np.ndarray
+    scale_vec: np.ndarray
     is_mask: bool
+    is_clip: bool
 
     # state
-    material_idxs: dict[tuple[StrokeColor, FillColor], int]
-    mask_material_idx: int | None
-    transform_stack: list[np.ndarray]
+    material_idxs: dict[tuple[StrokeColor, FillColor] | Literal["mask"], int]
     cur_fill_id: int
     visited: set[int]
 
@@ -339,14 +356,14 @@ def _get_material(
 
 
 def _get_mask_material(ctx: BuildContext) -> int:
-    if ctx.mask_material_idx is not None:
-        return ctx.mask_material_idx
+    if "mask" in ctx.material_idxs:
+        return ctx.material_idxs["mask"]
 
     material = bpy.data.materials.new(ctx.gp.name + "_MaskMaterial")
     bpy.data.materials.create_gpencil_data(material)
     ctx.gp.materials.append(material)
     idx = len(ctx.gp.materials) - 1
-    ctx.mask_material_idx = idx
+    ctx.material_idxs["mask"] = idx
 
     assert material.grease_pencil
     material.grease_pencil.fill_color = (1, 1, 1, 1)  # type: ignore
@@ -355,26 +372,22 @@ def _get_mask_material(ctx: BuildContext) -> int:
     return idx
 
 
-def _apply_transform(transform: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """Given a transform (shape (4, 4)) and an array of positions (shape (N, 3)),
-    return an array of transformed positions (shape (N, 3))."""
-    x = np.pad(x, [(0, 0), (0, 1)], constant_values=1)[..., np.newaxis]
-    return (transform @ x)[..., :3, 0]
-
-
 def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
+    # we may visit a node multiple times if e.g. the simplification process
+    # assigns the same mask node to multiple nodes
     if node.addr in ctx.visited:
         return
     ctx.visited.add(node.addr)
 
-    transform = _expand_to_4x4(node.transform)
-    transform = ctx.transform_stack[-1] @ transform
-    ctx.transform_stack.append(transform)
-    transform = ctx.scale_mat @ transform
+    if not isinstance(node, (GroupNode, ShapeNode)):
+        return
 
     if node.mask:
         # TODO: do we need to reset the transform stack when building the mask?
         _gather_geometry_and_materials_data(replace(ctx, is_mask=True), node.mask)
+    if node.clip:
+        # TODO: do we need to reset the transform stack when building the clip?
+        _gather_geometry_and_materials_data(replace(ctx, is_clip=True), node.clip)
 
     if isinstance(node, GroupNode):
         for child in node.children:
@@ -382,21 +395,21 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
     elif isinstance(node, ShapeNode):
         strokes = _path_to_stroke_data(node)
         if not strokes:
-            ctx.transform_stack.pop()
             return  # for safety (otherwise add_strokes will crash)
 
-        layer = ctx.nodes_to_layers[node.addr]
+        layer = ctx.nodes_to_layers[node]
         if layer.name not in ctx.layer_to_builder:
             ctx.layer_to_builder[layer.name] = LayerBuilder(layer)
         builder = ctx.layer_to_builder[layer.name]
 
         builder.add_stroke_lengths([len(s.position) for s in strokes])
 
-        if ctx.is_mask:
+        if ctx.is_mask or ctx.is_clip:
             mat_idx = _get_mask_material(ctx)
         else:
             mat_idx = _get_material(ctx, node.stroke_color, node.fill_color)
-        no_stroke = node.stroke_color is None
+        # note: clip paths do not take stroke width into account
+        no_stroke = node.stroke_color is None or ctx.is_clip
 
         # curve-domain attributes
         # curve_type = np.full((len(strokes),), 2, dtype=np.int8)  # 2 => bezier
@@ -412,13 +425,9 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
         builder.append_to_attr("hide_stroke", "BOOLEAN", "CURVE", hide_stroke)
 
         # point-domain attributes
-        position = _apply_transform(transform, np.vstack([s.position for s in strokes]))
-        handle_left = _apply_transform(
-            transform, np.vstack([s.handle_left for s in strokes])
-        )
-        handle_right = _apply_transform(
-            transform, np.vstack([s.handle_right for s in strokes])
-        )
+        position = ctx.scale_vec * np.vstack([s.position for s in strokes])
+        handle_left = ctx.scale_vec * np.vstack([s.handle_left for s in strokes])
+        handle_right = ctx.scale_vec * np.vstack([s.handle_right for s in strokes])
         handle_type = np.full((len(position),), 0, dtype=np.int8)  # 0 => free
         radius = np.full(
             (len(position),), node.stroke_width * ctx.scale * 0.5, dtype=np.float32
@@ -430,27 +439,24 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
         builder.append_to_attr("handle_type_right", "INT8", "POINT", handle_type)
         builder.append_to_attr("radius", "FLOAT", "POINT", radius)
 
-    ctx.transform_stack.pop()
-
 
 def _create_geometry_and_materials(
     gp: bpy.types.GreasePencil,
     root_node: PaintNode,
-    nodes_to_layers: Mapping[int, bpy.types.GreasePencilLayer],
+    nodes_to_layers: Mapping[PaintNode, bpy.types.GreasePencilLayer],
     scale: float,
 ):
     # negate Z to flip Z-down convention to Z-up
-    scale_mat = np.diag([scale, scale, -scale, 1.0])
+    scale_vec = np.array([scale, scale, -scale])
 
     ctx = BuildContext(
         gp=gp,
         nodes_to_layers=nodes_to_layers,
         scale=scale,
-        scale_mat=scale_mat,
+        scale_vec=scale_vec,
         is_mask=False,
+        is_clip=False,
         material_idxs={},
-        mask_material_idx=None,
-        transform_stack=[np.identity(4, dtype=np.float32)],
         cur_fill_id=1,
         visited=set(),
         layer_to_builder={},
@@ -487,6 +493,11 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
         min=0.0,
         precision=3,
     )
+    center_geometry: bpy.props.BoolProperty(
+        name="Center Geometry",
+        description="Center the geometry's bounding box on the origin",
+        default=True,
+    )
 
     def execute(self, context: bpy.types.Context):
         print(self.filepath)
@@ -507,9 +518,17 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
         print("gp", gp_end - parse_end)
 
         obj = bpy.data.objects.new(obj_name, gp)
-        context.scene.collection.objects.link(obj)
-        link_end = time.time()
-        print("link", link_end - gp_end)
+        context.collection.objects.link(obj)
+
+        scene: bpy.types.Scene = context.scene
+        obj.location = scene.cursor.location
+        select_only(obj, context.view_layer)
+        if self.center_geometry:
+            old_pivot = scene.tool_settings.transform_pivot_point
+            scene.tool_settings.transform_pivot_point = "BOUNDING_BOX_CENTER"
+            bpy.ops.object.origin_set(type="GEOMETRY_ORIGIN")
+            scene.tool_settings.transform_pivot_point = old_pivot
+
         return {"FINISHED"}
 
 

@@ -89,6 +89,44 @@ def _get_mask(paint: tvg.Paint) -> tuple[tvg.Result, tvg.Paint | None, tvg.MaskM
     )
 
 
+def _get_clip(paint: tvg.Paint) -> tvg.Paint | None:
+    paint.thorvg_lib.tvg_paint_get_clip.argtypes = [
+        tvg.paint.PaintPointer,
+    ]
+    paint.thorvg_lib.tvg_paint_get_clip.restype = tvg.paint.PaintPointer
+    clipper = paint.thorvg_lib.tvg_paint_get_clip(paint._paint)
+    if clipper:
+        return _ptr_to_paint_obj(paint.engine, clipper)
+    else:
+        return None
+
+
+def get_aabb(paint: tvg.Paint) -> tuple[tvg.Result, float, float, float, float]:
+    """Get the bounding box of the given Paint.
+    As of 1.1.3, tvg.Paint.get_aabb() does not give an actual Result; this is a fixed version.
+    """
+    x = ctypes.c_float()
+    y = ctypes.c_float()
+    w = ctypes.c_float()
+    h = ctypes.c_float()
+    paint.thorvg_lib.tvg_paint_get_aabb.argtypes = [
+        tvg.paint.PaintPointer,
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+        ctypes.POINTER(ctypes.c_float),
+    ]
+    paint.thorvg_lib.tvg_paint_get_aabb.restype = tvg.Result
+    result = paint.thorvg_lib.tvg_paint_get_aabb(
+        paint._paint,
+        ctypes.pointer(x),
+        ctypes.pointer(y),
+        ctypes.pointer(w),
+        ctypes.pointer(h),
+    )
+    return result, x.value, y.value, w.value, h.value
+
+
 def _addr(ptr: tvg.paint.PaintPointer) -> int:
     assert ptr.value is not None
     return ptr.value
@@ -111,16 +149,29 @@ class PaintNode:
         self.name = name
         self.transform = _matrix_to_numpy(_check(paint.get_transform()))
         self.visible = bool(paint.get_visible())
-        self.mask: PaintNode | None = None
-        self.mask_method: tvg.MaskMethod = tvg.MaskMethod.NONE
         self.opacity = _check(paint.get_opacity()) / 255
 
-    def set_mask(self, mask: "PaintNode", mask_method: tvg.MaskMethod):
-        self.mask = mask
-        self.mask_method = mask_method
+        # to help with removing extraneous clip paths later
+        self.aabb = _check(get_aabb(paint))
+
+        parent = _get_parent_ptr(paint)
+        self.parent_addr = _addr(parent) if parent else None
+
+        # to be set later
+        self.mask: PaintNode | None = None
+        self.mask_method: tvg.MaskMethod = tvg.MaskMethod.NONE
+        self.clip: PaintNode | None = None
 
     def __str__(self):
-        return f'<{type(self).__name__} {self.addr:x} "{self.name}" {self.visible}>'
+        return f'<{type(self).__name__} {self.addr} "{self.name}">'
+
+    __repr__ = __str__
+
+    def __hash__(self):
+        return hash(self.addr)
+
+    def __eq__(self, value: object) -> bool:
+        return isinstance(value, PaintNode) and value.addr == self.addr
 
 
 Float4 = tuple[float, float, float, float]
@@ -134,7 +185,7 @@ class ShapeNode(PaintNode):
 
         path_cmds, path_pts = _check(paint.get_path())
         self.path_cmds = list(path_cmds)
-        self.path_pts = [(pt.x, pt.y) for pt in path_pts]
+        self.path_pts = np.array([[pt.x, pt.y] for pt in path_pts])  # (N, 2)
 
         try:
             col = _check(paint.get_stroke_color())
@@ -161,6 +212,11 @@ class ShapeNode(PaintNode):
             col[3] / 255,
         )
 
+    def transform_pts(self, transform: np.ndarray):
+        x = self.path_pts
+        x = np.pad(x, [(0, 0), (0, 1)], constant_values=1)[..., np.newaxis]
+        self.path_pts = (transform @ x)[..., :2, 0]
+
 
 class GroupNode(PaintNode):
     def __init__(self, paint: tvg.Paint, name: str = ""):
@@ -180,6 +236,7 @@ class TextNode(PaintNode):
 def debug_print(node: PaintNode, depth=0):
     indent = "    " * depth
     print(indent + str(node))
+    print(indent + "  Parent:", node.parent_addr)
     print(
         indent + "  Transform:",
         node.transform[0][0],
@@ -189,13 +246,52 @@ def debug_print(node: PaintNode, depth=0):
         node.transform[1][1],
         node.transform[1][2],
     )
+    if isinstance(node, ShapeNode):
+        # print(
+        #     indent
+        #     + f"  cmds {[cmd.value for cmd in node.path_cmds]}, pts {[(round(p[0]), round(p[1])) for p in node.path_pts]}"
+        # )
+        print(indent + f"  {len(node.path_cmds)} cmds, {len(node.path_pts)} pts")
     print(indent + "  Mask: " + node.mask_method.name)
     if node.mask:
         debug_print(node.mask, depth + 1)
+    if node.clip:
+        print(indent + "  Clip")
+        debug_print(node.clip, depth + 1)
     if isinstance(node, GroupNode):
         print(indent + "  Children:")
         for c in node.children:
             debug_print(c, depth + 1)
+
+
+def _is_rect(pts: np.ndarray):
+    return len(pts) == 4 and (
+        (
+            pts[0][0] == pts[1][0]
+            and pts[1][1] == pts[2][1]
+            and pts[2][0] == pts[3][0]
+            and pts[3][1] == pts[0][1]
+        )
+        or (
+            pts[0][1] == pts[1][1]
+            and pts[1][0] == pts[2][0]
+            and pts[2][1] == pts[3][1]
+            and pts[3][0] == pts[0][0]
+        )
+    )
+
+
+def _is_extraneous_rect_clip(node: PaintNode, clip: ShapeNode) -> bool:
+    if clip.path_cmds != [
+        tvg.PathCommand.MOVE_TO,
+        tvg.PathCommand.LINE_TO,
+        tvg.PathCommand.LINE_TO,
+        tvg.PathCommand.LINE_TO,
+        tvg.PathCommand.CLOSE,
+    ] or not _is_rect(clip.path_pts):
+        return False
+
+    return bool(np.isclose(node.aabb, clip.aabb).all())
 
 
 def _extract_data(pic: tvg.Picture) -> PaintNode:
@@ -229,14 +325,17 @@ def _extract_data(pic: tvg.Picture) -> PaintNode:
 
     visit_later: list[tvg.Paint] = [pic]
     cur_paints: dict[int, tuple[tvg.Paint, str]] = {}
+    cur_paints_in_hierarchy: set[int] = set()
     cur_children: dict[int, list[int]] = {}
     masks: dict[int, tuple[tvg.Paint, tvg.MaskMethod]] = {}
+    clips: dict[int, tvg.Paint] = {}
 
     def _visit(ptr: tvg.paint.PaintPointer, data: bytes) -> bool:
         paint = _ptr_to_paint_obj(engine, ptr)
         addr = _addr(paint._paint)
         name = id_to_names.get(paint.get_id(), "")
         cur_paints[addr] = (paint, name)
+        cur_paints_in_hierarchy.add(addr)
 
         parent_ptr = _get_parent_ptr(paint)
         if parent_ptr:
@@ -253,6 +352,21 @@ def _extract_data(pic: tvg.Picture) -> PaintNode:
             # we'll iterate over them separately later
             if isinstance(mask, tvg.Scene):
                 visit_later.append(mask)
+            else:
+                mask_name = id_to_names.get(mask.get_id(), "")
+                cur_paints[_addr(mask._paint)] = (mask, mask_name)
+
+        clip = _get_clip(paint)
+        if clip:
+            clips[addr] = clip
+            # i think clips are always shape paints actually,
+            # but just in case
+            if isinstance(clip, tvg.Scene):
+                visit_later.append(clip)
+            else:
+                clip_name = id_to_names.get(clip.get_id(), "")
+                cur_paints[_addr(clip._paint)] = (clip, clip_name)
+
         return True
 
     paint_nodes: dict[int, PaintNode] = {}
@@ -273,7 +387,7 @@ def _extract_data(pic: tvg.Picture) -> PaintNode:
             paint_nodes[addr] = node
 
         for addr, child_addrs in cur_children.items():
-            if addr in cur_paints:
+            if addr in cur_paints_in_hierarchy:
                 parent = paint_nodes[addr]
                 assert isinstance(parent, GroupNode)
                 parent.set_children(
@@ -281,16 +395,50 @@ def _extract_data(pic: tvg.Picture) -> PaintNode:
                 )
 
         cur_paints.clear()
+        cur_paints_in_hierarchy.clear()
         cur_children.clear()
 
+    # transform path points into world space
+    world_transforms: dict[PaintNode, np.ndarray] = {}
+
+    def _get_world_transform(node: PaintNode) -> np.ndarray:
+        if node in world_transforms:
+            return world_transforms[node]
+
+        transform = node.transform
+        if node.parent_addr:
+            parent = paint_nodes[node.parent_addr]
+            transform = _get_world_transform(parent) @ transform
+        world_transforms[node] = transform
+        return transform
+
+    for node in paint_nodes.values():
+        world_transform = _get_world_transform(node)
+        if isinstance(node, ShapeNode):
+            node.transform_pts(world_transform)
+
+    # assign masks and clips
+    pic_node = paint_nodes[_addr(pic._paint)]
     for addr, (mask, mask_method) in masks.items():
         node = paint_nodes[addr]
         mask_node = paint_nodes[_addr(mask._paint)]
-        node.set_mask(mask_node, mask_method)
+        node.mask = mask_node
+        node.mask_method = mask_method
+    for addr, clip in clips.items():
+        node = paint_nodes[addr]
+        clip_node = paint_nodes[_addr(clip._paint)]
+        # thorvg will add rectangular clips around the svg viewbox.
+        # we don't want these, so detect if a clip is a rectangle matching
+        # the svg's bounding box and do not add the clip if so
+        if not (
+            isinstance(clip_node, ShapeNode)
+            and _is_extraneous_rect_clip(pic_node, clip_node)
+        ):
+            node.clip = clip_node
 
     _check(accessor._del())
 
-    return paint_nodes[_addr(pic._paint)]
+    return pic_node
 
 
 def open_svg(path: str) -> PaintNode:
