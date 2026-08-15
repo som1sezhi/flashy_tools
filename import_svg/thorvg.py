@@ -217,6 +217,9 @@ class ShapeNode(PaintNode):
         x = np.pad(x, [(0, 0), (0, 1)], constant_values=1)[..., np.newaxis]
         self.path_pts = (transform @ x)[..., :2, 0]
 
+        det = transform[0][0] * transform[1][1] - transform[0][1] * transform[1][0]
+        self.stroke_width *= np.sqrt(abs(det))
+
 
 class GroupNode(PaintNode):
     def __init__(self, paint: tvg.Paint, name: str = ""):
@@ -291,7 +294,7 @@ def _is_extraneous_rect_clip(node: PaintNode, clip: ShapeNode) -> bool:
     ] or not _is_rect(clip.path_pts):
         return False
 
-    return bool(np.isclose(node.aabb, clip.aabb).all())
+    return np.allclose(node.aabb, clip.aabb)
 
 
 def _extract_data(pic: tvg.Picture) -> PaintNode:
