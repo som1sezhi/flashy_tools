@@ -1,4 +1,4 @@
-from . import frame_picker, import_svg, set_ease, skew_controls
+from . import frame_picker, gp_ops, import_svg, set_ease, skew_controls
 
 bl_info = {
     "name": "flashy-tools",
@@ -6,7 +6,7 @@ bl_info = {
     "category": "Animation",
 }
 
-modules = [set_ease, skew_controls, frame_picker, import_svg]
+modules = [set_ease, skew_controls, frame_picker, import_svg, gp_ops]
 
 
 def register():
