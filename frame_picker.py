@@ -4,6 +4,8 @@ from typing import cast
 
 import bpy
 
+from .utils import select_only
+
 FP_PROP_NAME = "Frame"
 
 
@@ -140,12 +142,6 @@ def restore_bone_selection(armature_obj: bpy.types.Object, selection_state):
     armature_obj.data.bones.active = original_active_bone
 
 
-def select_only(obj: bpy.types.Object, vl: bpy.types.ViewLayer):
-    bpy.ops.object.select_all(action="DESELECT")
-    obj.select_set(True, view_layer=vl)
-    vl.objects.active = obj
-
-
 def hide_all_gp_layers_except(
     gp: bpy.types.GreasePencil, tree_node: bpy.types.GreasePencilTreeNode
 ) -> dict[str, bool]:
@@ -185,7 +181,7 @@ def gather_frames(tree_node: bpy.types.GreasePencilTreeNode) -> set[int]:
     else:
         assert isinstance(tree_node, bpy.types.GreasePencilLayerGroup)
         for child in tree_node.children:
-            frames.union(gather_frames(child))
+            frames.update(gather_frames(child))
     return frames
 
 
@@ -502,7 +498,8 @@ class FLASHY_OP_setup_frame_picker(bpy.types.Operator):
         else:
             should_create_driver = True
         if should_create_driver:
-            driver = cast(bpy.types.Driver, mod.driver_add("offset"))
+            driver = cast(bpy.types.FCurve, mod.driver_add("offset")).driver
+            assert driver
             driver.type = "SCRIPTED"
             var = driver.variables.new()
             var.name = "fr"
