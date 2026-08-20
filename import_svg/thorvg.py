@@ -1,8 +1,11 @@
+import abc
 import ctypes
-from typing import TypeVar, overload
+from typing import NamedTuple, TypeVar, overload
 
 import numpy as np
 import thorvg_python as tvg
+
+from ..utils import invlerp, lerp
 
 
 class ThorVGException(Exception):
@@ -17,6 +20,8 @@ T = TypeVar("T")
 T2 = TypeVar("T2")
 T3 = TypeVar("T3")
 T4 = TypeVar("T4")
+T5 = TypeVar("T5")
+T6 = TypeVar("T6")
 
 
 @overload
@@ -29,6 +34,10 @@ def _check(ret: tuple[tvg.Result, T, T2]) -> tuple[T, T2]: ...
 def _check(ret: tuple[tvg.Result, T, T2, T3]) -> tuple[T, T2, T3]: ...
 @overload
 def _check(ret: tuple[tvg.Result, T, T2, T3, T4]) -> tuple[T, T2, T3, T4]: ...
+@overload
+def _check(
+    ret: tuple[tvg.Result, T, T2, T3, T4, T5, T6],
+) -> tuple[T, T2, T3, T4, T5, T6]: ...
 def _check(ret):
     if isinstance(ret, tuple):
         if ret[0] != tvg.Result.SUCCESS:
@@ -127,6 +136,62 @@ def get_aabb(paint: tvg.Paint) -> tuple[tvg.Result, float, float, float, float]:
     return result, x.value, y.value, w.value, h.value
 
 
+def _get_stroke_gradient(self: tvg.Shape) -> tuple[tvg.Result, tvg.Gradient | None]:
+    """Get the stroke gradient of the given shape.
+    As of 1.1.3, tvg.Shape.get_stroke_gradient() does not handle the case of no gradient
+    correctly, so this is a fixed version.
+    """
+    grad = tvg.gradient.GradientPointer()
+    self.thorvg_lib.tvg_shape_get_stroke_gradient.argtypes = [
+        tvg.paint.PaintPointer,
+        ctypes.POINTER(tvg.gradient.GradientPointer),
+    ]
+    self.thorvg_lib.tvg_shape_get_stroke_gradient.restype = tvg.Result
+    result = self.thorvg_lib.tvg_shape_get_stroke_gradient(
+        self._paint,
+        ctypes.pointer(grad),
+    )
+    if not grad:
+        return result, None
+    result, grad_type = tvg.Gradient(self.engine, grad).get_type()
+    if grad_type == tvg.TvgType.LINEAR_GRAD:
+        return result, tvg.LinearGradient(self.engine, grad)
+    elif grad_type == tvg.TvgType.RADIAL_GRAD:
+        return result, tvg.RadialGradient(self.engine, grad)
+    elif result != tvg.Result.SUCCESS:
+        return result, None
+    else:
+        raise RuntimeError(f"Invalid gradient type {grad_type}")
+
+
+def _get_gradient(
+    self: tvg.Shape,
+) -> tuple[tvg.Result, tvg.LinearGradient | tvg.RadialGradient | None]:
+    """Get the fill gradient of the given shape.
+    As of 1.1.3, tvg.Shape.get_gradient() does not handle the case of no gradient correctly,
+    so this is a fixed version.
+    """
+    grad = tvg.gradient.GradientPointer()
+    self.thorvg_lib.tvg_shape_get_gradient.argtypes = [
+        tvg.paint.PaintPointer,
+        ctypes.POINTER(tvg.gradient.GradientPointer),
+    ]
+    self.thorvg_lib.tvg_shape_get_gradient.restype = tvg.Result
+    result = self.thorvg_lib.tvg_shape_get_gradient(
+        self._paint,
+        ctypes.pointer(grad),
+    )
+    if not grad:
+        return result, None
+    result, tvg_type = tvg.Gradient(self.engine, grad).get_type()
+    if tvg_type == tvg.TvgType.LINEAR_GRAD:
+        return result, tvg.LinearGradient(self.engine, grad)
+    elif tvg_type == tvg.TvgType.RADIAL_GRAD:
+        return result, tvg.RadialGradient(self.engine, grad)
+    else:
+        raise RuntimeError(f"Invalid gradient TvgType: {tvg_type}")
+
+
 def _addr(ptr: tvg.paint.PaintPointer) -> int:
     assert ptr.value is not None
     return ptr.value
@@ -140,6 +205,83 @@ def _matrix_to_numpy(m: tvg.Matrix) -> np.ndarray:
             [m.e31, m.e32, m.e33],
         ]
     )
+
+
+Float4 = tuple[float, float, float, float]
+ColorStop = tuple[float, Float4]
+
+
+class LinearGradAttrs(NamedTuple):
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+
+
+class RadialGradAttrs(NamedTuple):
+    cx: float
+    cy: float
+    r: float
+    fx: float
+    fy: float
+    fr: float
+
+
+class Gradient(abc.ABC):
+    def __init__(self, grad: tvg.Gradient):
+        color_stops = _check(grad.get_color_stops())
+        self.stops: tuple[ColorStop, ...] = tuple(
+            (s.offset, (s.r / 255, s.g / 255, s.b / 255, s.a / 255))
+            for s in color_stops
+        )
+        self.spread = _check(grad.get_spread())
+        self.transform = _matrix_to_numpy(_check(grad.get_transform()))
+        self.type = _check(grad.get_type())
+        if isinstance(grad, tvg.LinearGradient):
+            self.attrs = LinearGradAttrs(*_check(grad.get()))
+        else:
+            assert isinstance(grad, tvg.RadialGradient)
+            self.attrs = RadialGradAttrs(*_check(grad.get()))
+
+    def key(self):
+        return (
+            self.type,
+            self.stops,
+            self.spread,
+            # TODO: add focus point info for radial gradient
+        )
+
+    def eval_stops(self, t: float) -> Float4:
+        assert len(self.stops) >= 2
+        i = 1
+        while i < len(self.stops) - 1 and self.stops[i][0] < t:
+            i += 1
+        fac = invlerp(self.stops[i - 1][0], self.stops[i][0], t)
+        fac = max(0, min(1, fac))
+        a = self.stops[i - 1][1]
+        b = self.stops[i][1]
+        return tuple(lerp(a[j], b[j], fac) for j in range(4))  # type: ignore
+
+    def avg_color(self) -> Float4:
+        splits = [
+            (self.stops[i][0] + self.stops[i + 1][0]) / 2
+            for i in range(len(self.stops) - 1)
+        ]
+        splits.insert(0, 0)
+        splits.append(1)
+        accum = [0.0, 0.0, 0.0, 0.0]
+        for i in range(len(splits) - 1):
+            weight = splits[i + 1] - splits[i]
+            for j in range(4):
+                accum[j] += weight * self.stops[i][1][j]
+        return tuple(accum)  # type: ignore
+
+    def __str__(self):
+        return f"<{type(self).__name__}>"
+
+
+StrokeColor = Float4 | Gradient | None
+FillColor = Float4 | Gradient
 
 
 class PaintNode:
@@ -161,6 +303,7 @@ class PaintNode:
         self.mask: PaintNode | None = None
         self.mask_method: tvg.MaskMethod = tvg.MaskMethod.NONE
         self.clip: PaintNode | None = None
+        self.world_transform = self.transform
 
     def __str__(self):
         return f'<{type(self).__name__} {self.addr} "{self.name}">'
@@ -174,11 +317,6 @@ class PaintNode:
         return isinstance(value, PaintNode) and value.addr == self.addr
 
 
-Float4 = tuple[float, float, float, float]
-StrokeColor = Float4 | None
-FillColor = Float4
-
-
 class ShapeNode(PaintNode):
     def __init__(self, paint: tvg.Shape, name: str = ""):
         super().__init__(paint, name)
@@ -187,30 +325,38 @@ class ShapeNode(PaintNode):
         self.path_cmds = list(path_cmds)
         self.path_pts = np.array([[pt.x, pt.y] for pt in path_pts])  # (N, 2)
 
-        try:
-            col = _check(paint.get_stroke_color())
-            self.stroke_color: StrokeColor = (
+        grad = _check(_get_stroke_gradient(paint))
+        if grad:
+            self.stroke_color: StrokeColor = Gradient(grad)
+        else:
+            try:
+                col = _check(paint.get_stroke_color())
+                self.stroke_color: StrokeColor = (
+                    col[0] / 255,
+                    col[1] / 255,
+                    col[2] / 255,
+                    col[3] / 255,
+                )
+            except ThorVGException as e:
+                if e.result == tvg.Result.INSUFFICIENT_CONDITION:
+                    self.stroke_color = None
+                else:
+                    raise
+        self.stroke_width = _check(paint.get_stroke_width())
+        self.stroke_cap = _check(paint.get_stroke_cap())
+        self.stroke_join = _check(paint.get_stroke_join())
+        self.stroke_miterlimit = _check(paint.get_stroke_miterlimit())
+        grad = _check(_get_gradient(paint))
+        if grad:
+            self.fill_color: FillColor = Gradient(grad)
+        else:
+            col = _check(paint.get_fill_color())
+            self.fill_color: FillColor = (
                 col[0] / 255,
                 col[1] / 255,
                 col[2] / 255,
                 col[3] / 255,
             )
-        except ThorVGException as e:
-            if e.result == tvg.Result.INSUFFICIENT_CONDITION:
-                self.stroke_color = None
-            else:
-                raise
-        self.stroke_width = _check(paint.get_stroke_width())
-        self.stroke_cap = _check(paint.get_stroke_cap())
-        self.stroke_join = _check(paint.get_stroke_join())
-        self.stroke_miterlimit = _check(paint.get_stroke_miterlimit())
-        col = _check(paint.get_fill_color())
-        self.fill_color: FillColor = (
-            col[0] / 255,
-            col[1] / 255,
-            col[2] / 255,
-            col[3] / 255,
-        )
 
     def transform_pts(self, transform: np.ndarray):
         x = self.path_pts
@@ -236,25 +382,37 @@ class TextNode(PaintNode):
         # currently unsupported, so no need to record data here
 
 
+def _debug_print_matrix(prefix: str, mat: np.ndarray):
+    print(
+        prefix,
+        mat[0][0],
+        mat[0][1],
+        mat[0][2],
+        mat[1][0],
+        mat[1][1],
+        mat[1][2],
+    )
+
+
 def debug_print(node: PaintNode, depth=0):
     indent = "    " * depth
     print(indent + str(node))
     print(indent + "  Parent:", node.parent_addr)
-    print(
-        indent + "  Transform:",
-        node.transform[0][0],
-        node.transform[0][1],
-        node.transform[0][2],
-        node.transform[1][0],
-        node.transform[1][1],
-        node.transform[1][2],
-    )
+    _debug_print_matrix(indent + "  Transform:", node.transform)
     if isinstance(node, ShapeNode):
         # print(
         #     indent
         #     + f"  cmds {[cmd.value for cmd in node.path_cmds]}, pts {[(round(p[0]), round(p[1])) for p in node.path_pts]}"
         # )
         print(indent + f"  {len(node.path_cmds)} cmds, {len(node.path_pts)} pts")
+        print(indent + f"  Stroke: {node.stroke_color}")
+        if isinstance(node.stroke_color, Gradient):
+            _debug_print_matrix(indent + "  ", node.stroke_color.transform)
+            print(indent + "  " + str(node.stroke_color.attrs))
+        print(indent + f"  Fill: {node.fill_color}")
+        if isinstance(node.fill_color, Gradient):
+            _debug_print_matrix(indent + "  ", node.fill_color.transform)
+            print(indent + "  " + str(node.fill_color.attrs))
     print(indent + "  Mask: " + node.mask_method.name)
     if node.mask:
         debug_print(node.mask, depth + 1)
@@ -417,6 +575,7 @@ def _extract_data(pic: tvg.Picture) -> PaintNode:
 
     for node in paint_nodes.values():
         world_transform = _get_world_transform(node)
+        node.world_transform = world_transform
         if isinstance(node, ShapeNode):
             node.transform_pts(world_transform)
 

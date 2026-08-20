@@ -8,16 +8,19 @@ from typing import Literal, cast
 import bpy
 import numpy as np
 from bpy_extras.io_utils import ImportHelper
-from thorvg_python import PathCommand, StrokeCap, StrokeJoin
+from thorvg_python import PathCommand, StrokeCap, StrokeFill, StrokeJoin
 
-from ..utils import select_only
+from ..utils import lerp, select_only
 from .thorvg import (
     FillColor,
+    Gradient,
     GroupNode,
+    LinearGradAttrs,
     PaintNode,
+    RadialGradAttrs,
     ShapeNode,
     StrokeColor,
-    # debug_print,
+    debug_print,
     open_svg,
 )
 
@@ -298,7 +301,7 @@ class LayerBuilder:
         pad_len = wanted_len - incoming_data_len - len(self.data[name])
         if pad_len > 0:
             pad = [(0, pad_len)]
-            if data_type == "FLOAT_VECTOR":
+            if data_type in ("FLOAT_VECTOR", "FLOAT2"):
                 pad.append((0, 0))
             self.data[name] = np.pad(self.data[name], pad)
 
@@ -307,8 +310,9 @@ class LayerBuilder:
     ):
         if name not in self.attrs:
             self.attrs[name] = (data_type, domain)
-            if data_type == "FLOAT_VECTOR":
-                self.data[name] = np.array([], dtype=data.dtype).reshape((0, 3))
+            if data_type in ("FLOAT_VECTOR", "FLOAT2"):
+                size = 3 if data_type == "FLOAT_VECTOR" else 2
+                self.data[name] = np.array([], dtype=data.dtype).reshape((0, size))
             else:
                 self.data[name] = np.array([], dtype=data.dtype)
         self._extend_attr_data(name, len(data))
@@ -330,7 +334,7 @@ class LayerBuilder:
                 attribute = attributes.new(name, data_type, domain)  # type: ignore
             else:
                 attribute = attributes[name]
-            if data_type == "FLOAT_VECTOR":
+            if data_type in ("FLOAT_VECTOR", "FLOAT2"):
                 attribute.data.foreach_set("vector", np.ravel(data))  # type: ignore
             else:
                 attribute.data.foreach_set("value", data)  # type: ignore
@@ -339,17 +343,24 @@ class LayerBuilder:
 
 
 @dataclass
+class BuildOptions:
+    scale: float
+    stroke_grad_strat: Literal["AVERAGE", "VERTEX"]
+    fill_grad_strat: Literal["AVERAGE", "GRADIENT", "TEXTURE"]
+
+
+@dataclass
 class BuildContext:
     # inputs
     gp: bpy.types.GreasePencil
     nodes_to_layers: Mapping[PaintNode, bpy.types.GreasePencilLayer]
-    scale: float
+    opts: BuildOptions
     scale_vec: np.ndarray
     is_mask: bool
     is_clip: bool
 
     # state
-    material_idxs: dict[tuple[StrokeColor, FillColor] | Literal["mask"], int]
+    material_idxs: dict[tuple | Literal["mask"], int]
     cur_fill_id: int
     visited: set[int]
 
@@ -357,10 +368,86 @@ class BuildContext:
     layer_to_builder: dict[str, LayerBuilder]
 
 
+def _create_gradient_image(grad: Gradient):
+    if isinstance(grad.attrs, LinearGradAttrs):
+        # NOTE: blender's current behavior for texture clamping is to clamp
+        # right at the edge of the texture, which means it partially wraps to
+        # the other side of the texture and so the color ends up being a mix
+        # of the pixels on opposite sides of the texture. this is undesired
+        # for padded linear gradients, of course.
+        # to partially work around this, we split the texture into thirds
+        # and fill the first and last thirds with padding manually, to at
+        # least give some buffer space
+        IMG_W = 512 if grad.spread == StrokeFill.PAD else 128
+        img = bpy.data.images.new("gradient", IMG_W, 1, alpha=True)
+        for i in range(IMG_W):
+            if grad.spread == StrokeFill.PAD:
+                t = max(0, min(1, 3 * i / IMG_W - 1))
+            else:
+                t = i / (IMG_W - 1)
+            # only sample gradient where it is actually changing color,
+            # between the first and last stops
+            t = lerp(grad.stops[0][0], grad.stops[-1][0], t)
+            col = grad.eval_stops(t)
+            img.pixels[i * 4 : (i + 1) * 4] = col  # type: ignore
+        img.update()
+        return img
+    else:
+        raise NotImplementedError
+
+
+def _should_use_gradient_fill(ctx: BuildContext, grad: Gradient):
+    return (
+        ctx.opts.fill_grad_strat == "GRADIENT"
+        and len(grad.stops) == 2
+        and grad.spread == StrokeFill.PAD
+        # cannot represent radial gradients when the first stop is not at center
+        and not (isinstance(grad.attrs, RadialGradAttrs) and grad.stops[0][0] > 0)
+    )
+
+
+def _setup_material_fill_gradient(
+    ctx: BuildContext, gp_style: bpy.types.MaterialGPencilStyle, grad: Gradient
+):
+    if _should_use_gradient_fill(ctx, grad):
+        gp_style.fill_style = "GRADIENT"
+        gp_style.gradient_type = (
+            "LINEAR" if isinstance(grad.attrs, LinearGradAttrs) else "RADIAL"
+        )
+        gp_style.fill_color = _srgb_to_linear(grad.stops[0][1])  # type: ignore
+        gp_style.mix_color = _srgb_to_linear(grad.stops[1][1])  # type: ignore
+    else:
+        gp_style.fill_style = "TEXTURE"
+        gp_style.fill_image = _create_gradient_image(grad)
+        gp_style.texture_clamp = grad.spread == StrokeFill.PAD
+    gp_style.mix_factor = 0
+    gp_style.texture_offset = (-0.5, -0.5)
+    gp_style.texture_angle = 0
+    gp_style.texture_scale = (1, 1)
+
+
 def _get_material(
     ctx: BuildContext, stroke_color: StrokeColor, fill_color: FillColor
 ) -> int:
-    key = (stroke_color, fill_color)
+    if isinstance(stroke_color, Gradient):
+        if ctx.opts.stroke_grad_strat == "AVERAGE":
+            stroke_color = stroke_color.avg_color()
+        elif len(stroke_color.stops) == 1:
+            stroke_color = stroke_color.stops[0][1]
+        elif len(stroke_color.stops) == 0:
+            stroke_color = None
+    if isinstance(fill_color, Gradient):
+        if ctx.opts.fill_grad_strat == "AVERAGE":
+            fill_color = fill_color.avg_color()
+        elif len(fill_color.stops) == 1:
+            fill_color = fill_color.stops[0][1]
+        elif len(fill_color.stops) == 0:
+            fill_color = (0, 0, 0, 0)
+    stroke_key = (
+        stroke_color.key() if isinstance(stroke_color, Gradient) else stroke_color
+    )
+    fill_key = fill_color.key() if isinstance(fill_color, Gradient) else fill_color
+    key = (stroke_key, fill_key)
     if key in ctx.material_idxs:
         return ctx.material_idxs[key]
 
@@ -371,11 +458,20 @@ def _get_material(
     ctx.material_idxs[key] = idx
 
     assert material.grease_pencil
-    material.grease_pencil.fill_color = _srgb_to_linear(fill_color)  # type: ignore
-    if stroke_color:
+
+    if isinstance(stroke_color, Gradient):
+        # this color doesn't really matter since we're gonna be
+        # covering it up with vertex colors
+        material.grease_pencil.color = (0, 0, 0, 1)  # type: ignore
+    elif stroke_color:
         material.grease_pencil.color = _srgb_to_linear(stroke_color)  # type: ignore
     else:
         material.grease_pencil.color = (0, 0, 0, 0)  # type: ignore
+
+    if isinstance(fill_color, Gradient):
+        _setup_material_fill_gradient(ctx, material.grease_pencil, fill_color)
+    else:
+        material.grease_pencil.fill_color = _srgb_to_linear(fill_color)  # type: ignore
 
     return idx
 
@@ -395,6 +491,133 @@ def _get_mask_material(ctx: BuildContext) -> int:
     material.grease_pencil.color = (1, 1, 1, 1)  # type: ignore
 
     return idx
+
+
+@dataclass
+class StrokeUVTransforms:
+    translation: tuple[float, float]
+    rotation: float
+    scale: tuple[float, float]
+
+
+def _length_sq(vec: np.ndarray) -> float:
+    return np.dot(vec, vec)
+
+
+def _length(vec: np.ndarray) -> float:
+    return math.sqrt(np.dot(vec, vec))
+
+
+def _normalize_and_get_length(vec: np.ndarray) -> tuple[np.ndarray, float]:
+    length_sq = np.dot(vec, vec)
+    if length_sq > 1e-35:
+        length = math.sqrt(length_sq)
+        return vec / length, length
+    return np.zeros_like(vec), 0.0
+
+
+def _normalize(vec: np.ndarray) -> np.ndarray:
+    length_sq = np.dot(vec, vec)
+    if length_sq > 1e-35:
+        length = math.sqrt(length_sq)
+        return vec / length
+    return np.zeros_like(vec)
+
+
+def _get_curve_normal(positions: np.ndarray) -> np.ndarray:
+    # needed to accurately compute the stroke's local coordinate system.
+    # ported from blender:
+    # https://projects.blender.org/blender/blender/src/commit/fea4184c17f0af51c5a5bff3c41457f3a278ab55/source/blender/blenkernel/intern/grease_pencil.cc#L679
+    if len(positions) < 2:
+        return np.array((1.0, 0.0, 0.0))
+    # newell's method for calculating normals
+    normal = np.array((0.0, 0.0, 0.0))
+    prev_pt = positions[-1]
+    for cur_pt in positions:
+        normal[0] += (prev_pt[1] - cur_pt[1]) * (prev_pt[2] + cur_pt[2])
+        normal[1] += (prev_pt[2] - cur_pt[2]) * (prev_pt[0] + cur_pt[0])
+        normal[2] += (prev_pt[0] - cur_pt[0]) * (prev_pt[1] + cur_pt[1])
+        prev_pt = cur_pt
+    # handle degenerate case where all points are colinear
+    normal, length = _normalize_and_get_length(normal)
+    if length < np.finfo(float).eps * len(positions):
+        for i in range(len(positions) - 1):
+            segment_vec = positions[i] - positions[i + 1]
+            if np.dot(segment_vec, segment_vec) != 0:
+                normal = _normalize(np.array((segment_vec[1], -segment_vec[0], 0.0)))
+                break
+    return normal
+
+
+def _get_uv_transforms(
+    positions: np.ndarray,
+    grad: Gradient,
+    scale: float,
+    shape_transform: np.ndarray,
+    has_padding: bool,
+) -> StrokeUVTransforms:
+    if len(positions) < 2:
+        return StrokeUVTransforms((0, 0), 0, (1, -1))
+    pos0, pos1 = positions[0], positions[1]
+    xaxis = _normalize(pos1 - pos0)
+    yaxis = np.cross(_get_curve_normal(positions), xaxis)
+    if _length_sq(xaxis) == 0 or _length_sq(yaxis) == 0:
+        return StrokeUVTransforms((0, 0), 0, (1, -1))
+    layer_to_stroke = np.array(
+        [
+            [xaxis[0], xaxis[1], xaxis[2], -np.dot(pos0, xaxis)],
+            [yaxis[0], yaxis[1], yaxis[2], -np.dot(pos0, yaxis)],
+        ]
+    )
+    if isinstance(grad.attrs, LinearGradAttrs):
+        # linear gradient is bound by two lines.
+        # we want the stroke xaxis to be rotated to be perpendicular to these
+        # lines (in world space).
+        # we can't just transform (x1, y1) and (x2, y2) by the gradient transform
+        # to get the perpendicular, since skewing might be involved, so we
+        # instead transform (x1, y1) and the line through (x2, y2), and then
+        # project (x1, y1) onto the line to get the new endpoint
+        # TODO: since this doesn't depend on positions, we can probably
+        # factor this out and avoid repeating this work for each stroke
+        p1_orig = np.array([grad.attrs.x1, grad.attrs.y1])
+        p2_orig = np.array([grad.attrs.x2, grad.attrs.y2])
+        offset = p2_orig - p1_orig
+        l2_dir = np.array([-offset[1], offset[0]])
+        # account for start and end stops not being at 0/1
+        p1 = p1_orig + grad.stops[0][0] * offset
+        p2 = p1_orig + grad.stops[-1][0] * offset
+        transform = shape_transform @ grad.transform
+        p1_w = (transform @ np.append(p1, 1))[:2]
+        p2_w = (transform @ np.append(p2, 1))[:2]
+        l2_dir_w = (transform @ np.append(l2_dir, 0))[:2]
+        offset_w = p1_w - p2_w
+        p1_proj = p2_w + (
+            np.dot(offset_w, l2_dir_w) / np.dot(l2_dir_w, l2_dir_w) * l2_dir_w
+        )
+        # transform from SVG space to layer space
+        start = np.array([scale * p1_w[0], 0, -scale * p1_w[1], 1])
+        end = np.array([scale * p1_proj[0], 0, -scale * p1_proj[1], 1])
+        # transform to stroke's coord space
+        start = layer_to_stroke @ start
+        end = layer_to_stroke @ end
+        u = end - start
+        if has_padding:
+            start -= u
+            u *= 3
+        v = np.array([u[1], -u[0]])
+        tex_to_stroke = np.vstack([np.array([u, v, start]).T, [0.0, 0.0, 1.0]])
+        stroke_to_tex = np.linalg.pinv(tex_to_stroke)
+        # decompose into translation/rotation/scale. see:
+        # https://projects.blender.org/blender/blender/src/commit/fea4184c17f0af51c5a5bff3c41457f3a278ab55/source/blender/blenkernel/intern/grease_pencil.cc#L914
+        translation = tuple(stroke_to_tex[0:2, 2])
+        rotation = math.atan2(stroke_to_tex[1][0], stroke_to_tex[0][0])
+        xscale = 1 / _length(stroke_to_tex[0:2, 0])
+        yscale = 1 / _length(stroke_to_tex[0:2, 1])
+        if np.linalg.det(stroke_to_tex[0:2, 0:2]) < 0:
+            yscale = -yscale
+        return StrokeUVTransforms(translation, rotation, (xscale, yscale))
+    else:
+        raise NotImplementedError
 
 
 def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
@@ -434,30 +657,14 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
         # note: clip paths do not take stroke width into account
         no_stroke = node.stroke_color is None or ctx.is_clip
 
-        # curve-domain attributes
-        cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
-        fill_id = np.full((len(strokes),), ctx.cur_fill_id, dtype=np.int32)
-        material_index = np.full((len(strokes),), mat_idx, dtype=np.int32)
-        ctx.cur_fill_id += 1
-        builder.append_to_attr("cyclic", "BOOLEAN", "CURVE", cyclic)
-        builder.append_to_attr("fill_id", "INT", "CURVE", fill_id)
-        builder.append_to_attr("material_index", "INT", "CURVE", material_index)
-        if no_stroke:
-            hide_stroke = np.full((len(strokes),), no_stroke, dtype=np.bool)
-            builder.append_to_attr("hide_stroke", "BOOLEAN", "CURVE", hide_stroke)
-        if node.stroke_cap != StrokeCap.ROUND:
-            # TODO: proper square cap support? (maybe by adding new points at the ends)
-            cap = np.full((len(strokes),), 1, dtype=np.int8)  # 0 => flat
-            builder.append_to_attr("start_cap", "INT8", "CURVE", cap)
-            builder.append_to_attr("end_cap", "INT8", "CURVE", cap)
-
         # point-domain attributes
-        position = ctx.scale_vec * np.vstack([s.position for s in strokes])
+        transformed_positions = [ctx.scale_vec * s.position for s in strokes]
+        position = np.vstack(transformed_positions)
         handle_left = ctx.scale_vec * np.vstack([s.handle_left for s in strokes])
         handle_right = ctx.scale_vec * np.vstack([s.handle_right for s in strokes])
         handle_type = np.full((len(position),), 0, dtype=np.int8)  # 0 => free
         radius = np.full(
-            (len(position),), node.stroke_width * ctx.scale * 0.5, dtype=np.float32
+            (len(position),), node.stroke_width * ctx.opts.scale * 0.5, dtype=np.float32
         )
         builder.append_to_attr("position", "FLOAT_VECTOR", "POINT", position)
         builder.append_to_attr("handle_left", "FLOAT_VECTOR", "POINT", handle_left)
@@ -482,20 +689,57 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
             miter_angle = np.full((len(position),), angle, dtype=np.float32)
             builder.append_to_attr("miter_angle", "FLOAT", "POINT", miter_angle)
 
+        # curve-domain attributes
+        cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
+        fill_id = np.full((len(strokes),), ctx.cur_fill_id, dtype=np.int32)
+        material_index = np.full((len(strokes),), mat_idx, dtype=np.int32)
+        ctx.cur_fill_id += 1
+        builder.append_to_attr("cyclic", "BOOLEAN", "CURVE", cyclic)
+        builder.append_to_attr("fill_id", "INT", "CURVE", fill_id)
+        builder.append_to_attr("material_index", "INT", "CURVE", material_index)
+        if no_stroke:
+            hide_stroke = np.full((len(strokes),), no_stroke, dtype=np.bool)
+            builder.append_to_attr("hide_stroke", "BOOLEAN", "CURVE", hide_stroke)
+        if node.stroke_cap != StrokeCap.ROUND:
+            # TODO: proper square cap support? (maybe by adding new points at the ends)
+            cap = np.full((len(strokes),), 1, dtype=np.int8)  # 0 => flat
+            builder.append_to_attr("start_cap", "INT8", "CURVE", cap)
+            builder.append_to_attr("end_cap", "INT8", "CURVE", cap)
+        if ctx.gp.materials[mat_idx].grease_pencil.fill_style != "SOLID":  # type: ignore
+            grad = node.fill_color
+            assert isinstance(grad, Gradient)
+            has_padding = (
+                not _should_use_gradient_fill(ctx, grad)
+                and isinstance(grad.attrs, LinearGradAttrs)
+                and grad.spread == StrokeFill.PAD
+            )
+            uvs = [
+                _get_uv_transforms(
+                    positions, grad, ctx.opts.scale, node.world_transform, has_padding
+                )
+                for positions in transformed_positions
+            ]
+            uv_rotation = np.array([uv.rotation for uv in uvs], dtype=np.float32)
+            uv_translation = np.array([uv.translation for uv in uvs], dtype=np.float32)
+            uv_scale = np.array([uv.scale for uv in uvs], dtype=np.float32)
+            builder.append_to_attr("uv_rotation", "FLOAT", "CURVE", uv_rotation)
+            builder.append_to_attr("uv_translation", "FLOAT2", "CURVE", uv_translation)
+            builder.append_to_attr("uv_scale", "FLOAT2", "CURVE", uv_scale)
+
 
 def _create_geometry_and_materials(
     gp: bpy.types.GreasePencil,
     root_node: PaintNode,
     nodes_to_layers: Mapping[PaintNode, bpy.types.GreasePencilLayer],
-    scale: float,
+    opts: BuildOptions,
 ):
     # negate Z to flip Z-down convention to Z-up
-    scale_vec = np.array([scale, scale, -scale])
+    scale_vec = np.array([opts.scale, opts.scale, -opts.scale])
 
     ctx = BuildContext(
         gp=gp,
         nodes_to_layers=nodes_to_layers,
-        scale=scale,
+        opts=opts,
         scale_vec=scale_vec,
         is_mask=False,
         is_clip=False,
@@ -510,10 +754,12 @@ def _create_geometry_and_materials(
         builder.build()
 
 
-def _paint_to_gp(node: PaintNode, name: str, scale: float) -> bpy.types.GreasePencil:
+def _paint_to_gp(
+    node: PaintNode, name: str, opts: BuildOptions
+) -> bpy.types.GreasePencil:
     gp = bpy.data.grease_pencils.new(name)
     nodes_to_layers = _create_layers(gp, node, None, [])
-    _create_geometry_and_materials(gp, node, nodes_to_layers, scale)
+    _create_geometry_and_materials(gp, node, nodes_to_layers, opts)
     return gp
 
 
@@ -541,6 +787,45 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
         description="Center the geometry's bounding box on the origin",
         default=True,
     )
+    stroke_grad_strat: bpy.props.EnumProperty(
+        items=[
+            (
+                "AVERAGE",
+                "Average Color",
+                "Uniformly color the stroke with the average color of the gradient",
+            ),
+            (
+                "VERTEX",
+                "Vertex Coloring",
+                "Use vertex colors to approximate the stroke gradient",
+            ),
+        ],
+        name="Stroke Gradient Conversion",
+        description="Strategy for converting stroke gradients to Grease Pencil",
+        default="VERTEX",
+    )
+    fill_grad_strat: bpy.props.EnumProperty(
+        items=[
+            (
+                "AVERAGE",
+                "Average Color",
+                "Uniformly color the fill with the average color of the gradient",
+            ),
+            (
+                "GRADIENT",
+                "Gradient Fill",
+                "Use gradient fills for 2-color gradients, falling back on texture fills when needed (will match SVG appearance less, but colors will be easier to adjust)",
+            ),
+            (
+                "TEXTURE",
+                "Texture Fill",
+                "Create gradient textures and use them for material fills (will match SVG appearance more, but colors will be harder to adjust)",
+            ),
+        ],
+        name="Fill Gradient Conversion",
+        description="Strategy for converting fill gradients to Grease Pencil",
+        default="GRADIENT",
+    )
 
     def execute(self, context: bpy.types.Context):
         print(self.filepath)
@@ -556,7 +841,12 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
         _simplify_nodes(node)
         # debug_print(node)
         obj_name = os.path.basename(path)
-        gp = _paint_to_gp(node, obj_name, cast(float, self.scale))
+        options = BuildOptions(
+            scale=self.scale,
+            stroke_grad_strat=self.stroke_grad_strat,
+            fill_grad_strat=self.fill_grad_strat,
+        )
+        gp = _paint_to_gp(node, obj_name, options)
         gp_end = time.time()
         print("gp", gp_end - parse_end)
 
@@ -584,6 +874,10 @@ class FLASHY_PT_import_svg(bpy.types.Panel):
     bl_idname = "FLASHY_PT_import_svg"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return context.mode == "OBJECT"
 
     def draw(self, context: bpy.types.Context):
         layout = self.layout
