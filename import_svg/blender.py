@@ -10,7 +10,7 @@ import numpy as np
 from bpy_extras.io_utils import ImportHelper
 from thorvg_python import PathCommand, StrokeCap, StrokeFill, StrokeJoin
 
-from ..utils import lerp, select_only
+from ..utils import select_only
 from .thorvg import (
     FillColor,
     Gradient,
@@ -385,9 +385,6 @@ def _create_gradient_image(grad: Gradient):
                 t = max(0, min(1, 3 * i / IMG_W - 1))
             else:
                 t = i / (IMG_W - 1)
-            # only sample gradient where it is actually changing color,
-            # between the first and last stops
-            t = lerp(grad.stops[0][0], grad.stops[-1][0], t)
             col = grad.eval_stops(t)
             img.pixels[i * 4 : (i + 1) * 4] = col  # type: ignore
         img.update()
@@ -554,6 +551,7 @@ def _get_uv_transforms(
     grad: Gradient,
     scale: float,
     shape_transform: np.ndarray,
+    account_for_trim: bool,
     has_padding: bool,
 ) -> StrokeUVTransforms:
     if len(positions) < 2:
@@ -583,9 +581,15 @@ def _get_uv_transforms(
         p2_orig = np.array([grad.attrs.x2, grad.attrs.y2])
         offset = p2_orig - p1_orig
         l2_dir = np.array([-offset[1], offset[0]])
-        # account for start and end stops not being at 0/1
-        p1 = p1_orig + grad.stops[0][0] * offset
-        p2 = p1_orig + grad.stops[-1][0] * offset
+        if account_for_trim:
+            # if we're using gradient fills, we need to account for the
+            # start and end stops possibly not being at 0/1
+            p1 = p1_orig + grad.stops[0][0] * offset
+            p2 = p1_orig + grad.stops[-1][0] * offset
+        else:
+            # if we're using texture fills, those stops are already positioned
+            # correctly in the texture
+            p1, p2 = p1_orig, p2_orig
         transform = shape_transform @ grad.transform
         p1_w = (transform @ np.append(p1, 1))[:2]
         p2_w = (transform @ np.append(p2, 1))[:2]
@@ -708,14 +712,21 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
         if ctx.gp.materials[mat_idx].grease_pencil.fill_style != "SOLID":  # type: ignore
             grad = node.fill_color
             assert isinstance(grad, Gradient)
+            is_using_gradient_fill = _should_use_gradient_fill(ctx, grad)
+            account_for_trim = is_using_gradient_fill
             has_padding = (
-                not _should_use_gradient_fill(ctx, grad)
+                not is_using_gradient_fill
                 and isinstance(grad.attrs, LinearGradAttrs)
                 and grad.spread == StrokeFill.PAD
             )
             uvs = [
                 _get_uv_transforms(
-                    positions, grad, ctx.opts.scale, node.world_transform, has_padding
+                    positions,
+                    grad,
+                    ctx.opts.scale,
+                    node.world_transform,
+                    account_for_trim,
+                    has_padding,
                 )
                 for positions in transformed_positions
             ]
@@ -814,12 +825,12 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
             (
                 "GRADIENT",
                 "Gradient Fill",
-                "Use gradient fills for 2-color gradients, falling back on texture fills when needed (will match SVG appearance less, but colors will be easier to adjust)",
+                "Use gradient fills for 2-color gradients, falling back on texture fills when needed (will match SVG appearance less w.r.t color blending, but colors will be easier to adjust)",
             ),
             (
                 "TEXTURE",
                 "Texture Fill",
-                "Create gradient textures and use them for material fills (will match SVG appearance more, but colors will be harder to adjust)",
+                "Create gradient textures and use them for material fills (will match SVG appearance more w.r.t color blending, but colors will be harder to adjust)",
             ),
         ],
         name="Fill Gradient Conversion",
