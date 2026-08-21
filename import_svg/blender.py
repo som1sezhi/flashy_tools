@@ -445,6 +445,7 @@ def _setup_material_fill_gradient(
 def _get_material(
     ctx: BuildContext, stroke_color: StrokeColor, fill_color: FillColor
 ) -> int:
+    no_fill = fill_color == (0, 0, 0, 0)
     if isinstance(stroke_color, Gradient):
         if ctx.opts.stroke_grad_strat == "AVERAGE":
             stroke_color = stroke_color.avg_color()
@@ -458,7 +459,7 @@ def _get_material(
         elif len(fill_color.stops) == 1:
             fill_color = fill_color.stops[0][1]
         elif len(fill_color.stops) == 0:
-            fill_color = (0, 0, 0, 0)
+            fill_color = (0, 0, 0, 1)
     stroke_key = (
         stroke_color.key() if isinstance(stroke_color, Gradient) else stroke_color
     )
@@ -482,11 +483,15 @@ def _get_material(
     elif stroke_color:
         material.grease_pencil.color = _srgb_to_linear(stroke_color)  # type: ignore
     else:
-        material.grease_pencil.color = (0, 0, 0, 0)  # type: ignore
+        # opaque black is more visible if user turns strokes back on
+        material.grease_pencil.color = (0, 0, 0, 1)  # type: ignore
 
     if isinstance(fill_color, Gradient):
         _setup_material_fill_gradient(ctx, material.grease_pencil, fill_color)
-    else:
+    elif fill_color:
+        if no_fill:
+            # opaque black is more visible if user turns fills back on
+            fill_color = (0, 0, 0, 1)
         material.grease_pencil.fill_color = _srgb_to_linear(fill_color)  # type: ignore
 
     return idx
@@ -662,6 +667,7 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
             mat_idx = _get_material(ctx, node.stroke_color, node.fill_color)
         # note: clip paths do not take stroke width into account
         no_stroke = node.stroke_color is None or ctx.is_clip
+        no_fill = node.fill_color == (0, 0, 0, 0)
 
         if ctx.opts.stroke_grad_strat == "VERTEX" and isinstance(
             node.stroke_color, Gradient
@@ -713,10 +719,14 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
             builder.append_to_attr("opacity", "FLOAT", "POINT", opacity, 1)
 
         # curve-domain attributes
+        if no_fill:
+            fill_id_val = 0
+        else:
+            fill_id_val = ctx.cur_fill_id
+            ctx.cur_fill_id += 1
         cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
-        fill_id = np.full((len(strokes),), ctx.cur_fill_id, dtype=np.int32)
+        fill_id = np.full((len(strokes),), fill_id_val, dtype=np.int32)
         material_index = np.full((len(strokes),), mat_idx, dtype=np.int32)
-        ctx.cur_fill_id += 1
         builder.append_to_attr("cyclic", "BOOLEAN", "CURVE", cyclic)
         builder.append_to_attr("fill_id", "INT", "CURVE", fill_id)
         builder.append_to_attr("material_index", "INT", "CURVE", material_index)
