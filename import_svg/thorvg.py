@@ -5,7 +5,7 @@ from typing import NamedTuple, TypeVar, overload
 import numpy as np
 import thorvg_python as tvg
 
-from ..utils import invlerp, lerp
+from ..utils import invlerp, lerp, vec_length, vec_length_sq
 
 
 class ThorVGException(Exception):
@@ -261,6 +261,30 @@ class Gradient(abc.ABC):
         a = self.stops[i - 1][1]
         b = self.stops[i][1]
         return tuple(lerp(a[j], b[j], fac) for j in range(4))  # type: ignore
+
+    def eval_pos(self, pos: np.typing.ArrayLike) -> Float4:
+        if isinstance(self.attrs, LinearGradAttrs):
+            p1 = np.array([self.attrs.x1, self.attrs.y1])
+            p2 = np.array([self.attrs.x2, self.attrs.y2])
+            b = p2 - p1
+            a = pos - p1
+            b_len_sq = vec_length_sq(b)
+            t = np.dot(a, b) / b_len_sq if b_len_sq > 0 else 1
+        else:  # radial gradient
+            # NOTE: fx/fy/fr is not supported yet; we assume they have their
+            # default values (fx=cx, fy=cy, fr=0)
+            if self.attrs.r > 0:
+                c = np.array([self.attrs.cx, self.attrs.cy])
+                t = vec_length(pos - c) / self.attrs.r
+            else:
+                t = 1
+        if self.spread == tvg.StrokeFill.PAD:
+            t = max(0, min(1, t))
+        elif self.spread == tvg.StrokeFill.REPEAT:
+            t = t % 1
+        else:  # REFLECT
+            t = abs((t + 1) % 2 - 1)
+        return self.eval_stops(t)
 
     def avg_color(self) -> Float4:
         splits = [

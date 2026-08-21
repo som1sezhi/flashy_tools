@@ -10,7 +10,13 @@ import numpy as np
 from bpy_extras.io_utils import ImportHelper
 from thorvg_python import PathCommand, StrokeCap, StrokeFill, StrokeJoin
 
-from ..utils import select_only
+from ..utils import (
+    normalize,
+    normalize_and_get_length,
+    select_only,
+    vec_length,
+    vec_length_sq,
+)
 from .thorvg import (
     FillColor,
     Gradient,
@@ -20,7 +26,7 @@ from .thorvg import (
     RadialGradAttrs,
     ShapeNode,
     StrokeColor,
-    debug_print,
+    # debug_print,
     open_svg,
 )
 
@@ -278,6 +284,7 @@ def _srgb_to_linear(col: tuple[float, float, float, float]):
 
 
 DomainType = Literal["CURVE", "POINT"]
+VECTOR_TYPES = {"FLOAT2": 2, "FLOAT_VECTOR": 3, "FLOAT_COLOR": 4}
 
 
 class LayerBuilder:
@@ -286,6 +293,8 @@ class LayerBuilder:
         self.stroke_lengths: list[int] = []
         # maps name to (type, domain)
         self.attrs: dict[str, tuple[str, DomainType]] = {}
+        # maps name to extension fill value
+        self.default_vals: dict[str, float] = {}
         # maps name to data
         self.data: dict[str, np.ndarray] = {}
 
@@ -301,20 +310,28 @@ class LayerBuilder:
         pad_len = wanted_len - incoming_data_len - len(self.data[name])
         if pad_len > 0:
             pad = [(0, pad_len)]
-            if data_type in ("FLOAT_VECTOR", "FLOAT2"):
+            if data_type in VECTOR_TYPES:
                 pad.append((0, 0))
-            self.data[name] = np.pad(self.data[name], pad)
+            pad_val = self.default_vals.get(name, 0)
+            self.data[name] = np.pad(self.data[name], pad, constant_values=pad_val)
 
     def append_to_attr(
-        self, name: str, data_type: str, domain: DomainType, data: np.ndarray
+        self,
+        name: str,
+        data_type: str,
+        domain: DomainType,
+        data: np.ndarray,
+        default_val: float | None = None,
     ):
         if name not in self.attrs:
             self.attrs[name] = (data_type, domain)
-            if data_type in ("FLOAT_VECTOR", "FLOAT2"):
-                size = 3 if data_type == "FLOAT_VECTOR" else 2
+            if data_type in VECTOR_TYPES:
+                size = VECTOR_TYPES[data_type]
                 self.data[name] = np.array([], dtype=data.dtype).reshape((0, size))
             else:
                 self.data[name] = np.array([], dtype=data.dtype)
+            if default_val is not None:
+                self.default_vals[name] = default_val
         self._extend_attr_data(name, len(data))
         self.data[name] = np.concat([self.data[name], data], axis=0)
 
@@ -334,7 +351,9 @@ class LayerBuilder:
                 attribute = attributes.new(name, data_type, domain)  # type: ignore
             else:
                 attribute = attributes[name]
-            if data_type in ("FLOAT_VECTOR", "FLOAT2"):
+            if data_type == "FLOAT_COLOR":
+                attribute.data.foreach_set("color_srgb", np.ravel(data))  # type: ignore
+            elif data_type in VECTOR_TYPES:
                 attribute.data.foreach_set("vector", np.ravel(data))  # type: ignore
             else:
                 attribute.data.foreach_set("value", data)  # type: ignore
@@ -497,30 +516,6 @@ class StrokeUVTransforms:
     scale: tuple[float, float]
 
 
-def _length_sq(vec: np.ndarray) -> float:
-    return np.dot(vec, vec)
-
-
-def _length(vec: np.ndarray) -> float:
-    return math.sqrt(np.dot(vec, vec))
-
-
-def _normalize_and_get_length(vec: np.ndarray) -> tuple[np.ndarray, float]:
-    length_sq = np.dot(vec, vec)
-    if length_sq > 1e-35:
-        length = math.sqrt(length_sq)
-        return vec / length, length
-    return np.zeros_like(vec), 0.0
-
-
-def _normalize(vec: np.ndarray) -> np.ndarray:
-    length_sq = np.dot(vec, vec)
-    if length_sq > 1e-35:
-        length = math.sqrt(length_sq)
-        return vec / length
-    return np.zeros_like(vec)
-
-
 def _get_curve_normal(positions: np.ndarray) -> np.ndarray:
     # needed to accurately compute the stroke's local coordinate system.
     # ported from blender:
@@ -536,12 +531,12 @@ def _get_curve_normal(positions: np.ndarray) -> np.ndarray:
         normal[2] += (prev_pt[0] - cur_pt[0]) * (prev_pt[1] + cur_pt[1])
         prev_pt = cur_pt
     # handle degenerate case where all points are colinear
-    normal, length = _normalize_and_get_length(normal)
+    normal, length = normalize_and_get_length(normal)
     if length < np.finfo(float).eps * len(positions):
         for i in range(len(positions) - 1):
             segment_vec = positions[i] - positions[i + 1]
             if np.dot(segment_vec, segment_vec) != 0:
-                normal = _normalize(np.array((segment_vec[1], -segment_vec[0], 0.0)))
+                normal = normalize(np.array((segment_vec[1], -segment_vec[0], 0.0)))
                 break
     return normal
 
@@ -557,9 +552,9 @@ def _get_uv_transforms(
     if len(positions) < 2:
         return StrokeUVTransforms((0, 0), 0, (1, -1))
     pos0, pos1 = positions[0], positions[1]
-    xaxis = _normalize(pos1 - pos0)
+    xaxis = normalize(pos1 - pos0)
     yaxis = np.cross(_get_curve_normal(positions), xaxis)
-    if _length_sq(xaxis) == 0 or _length_sq(yaxis) == 0:
+    if vec_length_sq(xaxis) == 0 or vec_length_sq(yaxis) == 0:
         return StrokeUVTransforms((0, 0), 0, (1, -1))
     layer_to_stroke = np.array(
         [
@@ -615,13 +610,20 @@ def _get_uv_transforms(
         # https://projects.blender.org/blender/blender/src/commit/fea4184c17f0af51c5a5bff3c41457f3a278ab55/source/blender/blenkernel/intern/grease_pencil.cc#L914
         translation = tuple(stroke_to_tex[0:2, 2])
         rotation = math.atan2(stroke_to_tex[1][0], stroke_to_tex[0][0])
-        xscale = 1 / _length(stroke_to_tex[0:2, 0])
-        yscale = 1 / _length(stroke_to_tex[0:2, 1])
+        xscale = 1 / vec_length(stroke_to_tex[0:2, 0])
+        yscale = 1 / vec_length(stroke_to_tex[0:2, 1])
         if np.linalg.det(stroke_to_tex[0:2, 0:2]) < 0:
             yscale = -yscale
         return StrokeUVTransforms(translation, rotation, (xscale, yscale))
     else:
         raise NotImplementedError
+
+
+def _get_gradient_vertex_colors(local_positions: np.ndarray, grad: Gradient):
+    colors = np.array([grad.eval_pos(pos) for pos in local_positions])
+    opacity = colors[..., 3].copy()
+    colors[..., 3] = 1
+    return colors, opacity
 
 
 def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
@@ -661,6 +663,20 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
         # note: clip paths do not take stroke width into account
         no_stroke = node.stroke_color is None or ctx.is_clip
 
+        if ctx.opts.stroke_grad_strat == "VERTEX" and isinstance(
+            node.stroke_color, Gradient
+        ):
+            # transform positions back to node's local svg coordinates
+            ps = np.vstack([s.position for s in strokes])
+            ps = np.delete(ps, 1, axis=-1)
+            ps = np.pad(ps, [(0, 0), (0, 1)], constant_values=1)
+            ps = ps[..., np.newaxis]
+            inverse_transform = np.linalg.inv(node.world_transform)
+            ps = (inverse_transform @ ps)[..., :2, 0]
+            vertex_color, opacity = _get_gradient_vertex_colors(ps, node.stroke_color)
+        else:
+            vertex_color, opacity = None, None
+
         # point-domain attributes
         transformed_positions = [ctx.scale_vec * s.position for s in strokes]
         position = np.vstack(transformed_positions)
@@ -692,6 +708,9 @@ def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
                 angle = 3.142
             miter_angle = np.full((len(position),), angle, dtype=np.float32)
             builder.append_to_attr("miter_angle", "FLOAT", "POINT", miter_angle)
+        if vertex_color is not None and opacity is not None:
+            builder.append_to_attr("vertex_color", "FLOAT_COLOR", "POINT", vertex_color)
+            builder.append_to_attr("opacity", "FLOAT", "POINT", opacity, 1)
 
         # curve-domain attributes
         cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
