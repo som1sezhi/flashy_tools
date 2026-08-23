@@ -1,6 +1,6 @@
 import abc
 import ctypes
-from typing import NamedTuple, TypeVar, overload
+from typing import NamedTuple, TypeVar, TypeVarTuple, overload
 
 import numpy as np
 import thorvg_python as tvg
@@ -17,11 +17,7 @@ class ThorVGException(Exception):
 
 
 T = TypeVar("T")
-T2 = TypeVar("T2")
-T3 = TypeVar("T3")
-T4 = TypeVar("T4")
-T5 = TypeVar("T5")
-T6 = TypeVar("T6")
+Ts = TypeVarTuple("Ts")
 
 
 @overload
@@ -29,15 +25,7 @@ def _check(ret: tvg.Result) -> None: ...
 @overload
 def _check(ret: tuple[tvg.Result, T]) -> T: ...
 @overload
-def _check(ret: tuple[tvg.Result, T, T2]) -> tuple[T, T2]: ...
-@overload
-def _check(ret: tuple[tvg.Result, T, T2, T3]) -> tuple[T, T2, T3]: ...
-@overload
-def _check(ret: tuple[tvg.Result, T, T2, T3, T4]) -> tuple[T, T2, T3, T4]: ...
-@overload
-def _check(
-    ret: tuple[tvg.Result, T, T2, T3, T4, T5, T6],
-) -> tuple[T, T2, T3, T4, T5, T6]: ...
+def _check(ret: tuple[tvg.Result, *Ts]) -> tuple[*Ts]: ...
 def _check(ret):
     if isinstance(ret, tuple):
         if ret[0] != tvg.Result.SUCCESS:

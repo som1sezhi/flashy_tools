@@ -1,9 +1,9 @@
 import math
 import os
 import time
-from collections.abc import Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Literal, cast
+from typing import Literal, TypeVar, cast
 
 import bpy
 import numpy as np
@@ -19,6 +19,7 @@ from ..utils import (
 )
 from .thorvg import (
     FillColor,
+    Float4,
     Gradient,
     GroupNode,
     LinearGradAttrs,
@@ -94,6 +95,9 @@ def _simplify_nodes(node: PaintNode):
             i += len(child.children)
         else:
             i += 1
+
+
+# ============== functions for creating layers ==============
 
 
 def _create_layers(
@@ -194,6 +198,307 @@ def _create_layers_from_group_node(
 
 
 @dataclass
+class BuildOptions:
+    scale: float
+    use_vertex_colors: bool
+    stroke_grad_strat: Literal["AVERAGE", "VERTEX"]
+    fill_grad_strat: Literal["AVERAGE", "GRADIENT", "TEXTURE"]
+
+
+T = TypeVar("T")
+
+
+@dataclass
+class VisitShapesContext[T]:
+    is_mask: bool
+    is_clip: bool
+    visited: set[int]
+    data: T
+
+
+def _visit_shapes[T](
+    ctx: VisitShapesContext[T],
+    node: PaintNode,
+    callback: Callable[[VisitShapesContext[T], ShapeNode], None],
+):
+    if node.addr in ctx.visited:
+        return
+    ctx.visited.add(node.addr)
+
+    # ignore TextNode
+    if not isinstance(node, (GroupNode, ShapeNode)):
+        return
+
+    if node.mask:
+        _visit_shapes(replace(ctx, is_mask=True), node.mask, callback)
+    if node.clip:
+        _visit_shapes(replace(ctx, is_clip=True), node.clip, callback)
+
+    if isinstance(node, GroupNode):
+        for child in node.children:
+            _visit_shapes(ctx, child, callback)
+    elif isinstance(node, ShapeNode):
+        callback(ctx, node)
+
+
+# ============== functions for creating materials ==============
+
+
+ColorDesc = tuple[StrokeColor, FillColor | None] | Literal["mask"]
+"""A description of how a shape should be colored in blender,
+minus info like gradient transforms.
+"""
+
+
+@dataclass
+class GatherColorDescsData:
+    opts: BuildOptions  # input
+    nodes_to_material_keys: dict[ShapeNode, ColorDesc]  # output
+
+
+def _get_color_desc(opts: BuildOptions, node: ShapeNode) -> ColorDesc:
+    stroke = node.stroke_color
+    fill = node.fill_color
+
+    # indicate we don't care about the color since it'll get hidden anyway
+    if stroke == (0, 0, 0, 0):
+        stroke = None
+    if fill == (0, 0, 0, 0):
+        fill = None
+
+    if isinstance(stroke, Gradient):
+        if opts.stroke_grad_strat == "AVERAGE":
+            stroke = stroke.avg_color()
+        elif len(stroke.stops) == 1:
+            stroke = stroke.stops[0][1]
+        elif len(stroke.stops) == 0:
+            stroke = None
+
+    if isinstance(fill, Gradient):
+        if opts.fill_grad_strat == "AVERAGE":
+            fill = fill.avg_color()
+        elif len(fill.stops) == 1:
+            fill = fill.stops[0][1]
+        elif len(fill.stops) == 0:
+            fill = None
+
+    return (stroke, fill)
+
+
+def _gather_color_descs_callback(
+    ctx: VisitShapesContext[GatherColorDescsData], node: ShapeNode
+):
+    if ctx.is_mask or ctx.is_clip:
+        ctx.data.nodes_to_material_keys[node] = "mask"
+    else:
+        ctx.data.nodes_to_material_keys[node] = _get_color_desc(ctx.data.opts, node)
+
+
+def _gather_color_descs(
+    opts: BuildOptions, root_node: PaintNode
+) -> dict[ShapeNode, ColorDesc]:
+    ctx = VisitShapesContext(
+        is_mask=False,
+        is_clip=False,
+        visited=set(),
+        data=GatherColorDescsData(opts=opts, nodes_to_material_keys={}),
+    )
+    _visit_shapes(ctx, root_node, _gather_color_descs_callback)
+    return ctx.data.nodes_to_material_keys
+
+
+def _srgb_transfer_func(r: float) -> float:
+    return r / 12.92 if r <= 0.04045 else pow((r + 0.055) / 1.055, 2.4)
+
+
+def _srgb_to_linear(col: tuple[float, float, float, float]):
+    return (
+        _srgb_transfer_func(col[0]),
+        _srgb_transfer_func(col[1]),
+        _srgb_transfer_func(col[2]),
+        col[3],
+    )
+
+
+def _create_gradient_image(grad: Gradient):
+    if isinstance(grad.attrs, LinearGradAttrs):
+        # NOTE: blender's current behavior for texture clamping is to clamp
+        # right at the edge of the texture, which means it partially wraps to
+        # the other side of the texture and so the color ends up being a mix
+        # of the pixels on opposite sides of the texture. this is undesired
+        # for padded linear gradients, of course.
+        # to partially work around this, we split the texture into thirds
+        # and fill the first and last thirds with padding manually, to at
+        # least give some buffer space
+        IMG_W = 512 if grad.spread == StrokeFill.PAD else 128
+        img = bpy.data.images.new("gradient", IMG_W, 1, alpha=True)
+        for i in range(IMG_W):
+            if grad.spread == StrokeFill.PAD:
+                t = max(0, min(1, 3 * i / IMG_W - 1))
+            else:
+                t = i / (IMG_W - 1)
+            col = grad.eval_stops(t)
+            img.pixels[i * 4 : (i + 1) * 4] = col  # type: ignore
+        img.update()
+        return img
+    else:
+        raise NotImplementedError
+
+
+def _should_use_gradient_fill(opts: BuildOptions, grad: Gradient):
+    return (
+        opts.fill_grad_strat == "GRADIENT"
+        and len(grad.stops) == 2
+        and grad.spread == StrokeFill.PAD
+        # cannot represent radial gradients when the first stop is not at center
+        and not (isinstance(grad.attrs, RadialGradAttrs) and grad.stops[0][0] > 0)
+    )
+
+
+def _setup_material_fill_gradient(
+    opts: BuildOptions, gp_style: bpy.types.MaterialGPencilStyle, grad: Gradient
+):
+    if _should_use_gradient_fill(opts, grad):
+        gp_style.fill_style = "GRADIENT"
+        gp_style.gradient_type = (
+            "LINEAR" if isinstance(grad.attrs, LinearGradAttrs) else "RADIAL"
+        )
+        gp_style.fill_color = _srgb_to_linear(grad.stops[0][1])  # type: ignore
+        gp_style.mix_color = _srgb_to_linear(grad.stops[1][1])  # type: ignore
+    else:
+        gp_style.fill_style = "TEXTURE"
+        gp_style.fill_image = _create_gradient_image(grad)
+        gp_style.texture_clamp = grad.spread == StrokeFill.PAD
+    gp_style.mix_factor = 0
+    gp_style.texture_offset = (-0.5, -0.5)
+    gp_style.texture_angle = 0
+    gp_style.texture_scale = (1, 1)
+
+
+def _create_material(
+    gp: bpy.types.GreasePencil,
+    stroke_color: Float4,
+    fill_color: Float4 | Gradient,
+    opts: BuildOptions,
+    suffix: str = "_Material",
+) -> int:
+    material = bpy.data.materials.new(gp.name + suffix)
+    bpy.data.materials.create_gpencil_data(material)
+    gp.materials.append(material)
+    idx = len(gp.materials) - 1
+
+    assert material.grease_pencil
+
+    material.grease_pencil.color = _srgb_to_linear(stroke_color)  # type: ignore
+
+    if isinstance(fill_color, Gradient):
+        _setup_material_fill_gradient(opts, material.grease_pencil, fill_color)
+    else:
+        material.grease_pencil.fill_color = _srgb_to_linear(fill_color)  # type: ignore
+
+    return idx
+
+
+@dataclass
+class ShapeMaterialInfo:
+    mat_idx: int
+    stroke_vert_color: Float4 | Gradient | None
+    fill_vert_color: Float4 | None
+    # these are separated from MaterialInfo to allow different shapes
+    # to be e.g. stroke-only or fill-only while sharing the underlying
+    # material, which i hope to take advantage of later
+    hide_stroke: bool
+    hide_fill: bool
+
+
+MaterialKey = tuple[tuple | None, tuple | None]
+
+
+def _build_materials(
+    gp: bpy.types.GreasePencil,
+    color_descs: dict[ShapeNode, ColorDesc],
+    opts: BuildOptions,
+) -> dict[ShapeNode, ShapeMaterialInfo]:
+    # will populate and return at the end
+    node_to_mat_info: dict[ShapeNode, ShapeMaterialInfo] = {}
+    # allows for reusing materials if multiple keys turn out to need the same
+    # material specification
+    mat_spec_to_idx: dict[MaterialKey | Literal["mask"], int] = {}
+
+    for shape, desc in color_descs.items():
+        stroke: StrokeColor = None
+        fill: FillColor | None = None
+        stroke_vert_color: Float4 | Gradient | None = None
+        fill_vert_color: Float4 | None = None
+
+        if desc == "mask":
+            spec = "mask"
+            hide_stroke = shape.stroke_color is None or shape.stroke_color == (
+                0,
+                0,
+                0,
+                0,
+            )
+            hide_fill = shape.fill_color == (0, 0, 0, 0)
+        else:
+            # if using vertex colors:
+            #   - stroke is always opaque black (rely on vert cols/opacity)
+            #   - fill is opaque black unless it's a gradient
+            # if not using vertex colors:
+            #   - stroke is the stroke color, or opaque black for gradients
+            #   - fill is the fill color/gradient
+            stroke, fill = desc
+            if opts.use_vertex_colors:
+                if stroke is not None:
+                    stroke_vert_color = stroke
+                    stroke = (0, 0, 0, 1)
+                if fill is not None and not isinstance(fill, Gradient):
+                    fill_vert_color = fill
+                    fill = (0, 0, 0, 1)
+            else:
+                if stroke is not None and isinstance(stroke, Gradient):
+                    stroke_vert_color = stroke
+                    stroke = (0, 0, 0, 1)
+            stroke_key = stroke.key() if isinstance(stroke, Gradient) else stroke
+            fill_key = fill.key() if isinstance(fill, Gradient) else fill
+            spec = (stroke_key, fill_key)
+
+            hide_stroke = stroke is None
+            hide_fill = fill is None
+
+        # create new material if not already existing
+        if spec not in mat_spec_to_idx:
+            if spec == "mask":
+                idx = _create_material(
+                    gp, (1, 1, 1, 1), (1, 1, 1, 1), opts, "_MaskMaterial"
+                )
+                mat_spec_to_idx[spec] = idx
+            else:
+                # if the user unhides the stroke or fill of a shape,
+                # opaque black will be more clearly visible and give more of an
+                # indication about what the user has done
+                if stroke is None:
+                    stroke = (0, 0, 0, 1)
+                if fill is None:
+                    fill = (0, 0, 0, 1)
+                idx = _create_material(gp, stroke, fill, opts, "_Material")
+                mat_spec_to_idx[spec] = idx
+
+        node_to_mat_info[shape] = ShapeMaterialInfo(
+            mat_spec_to_idx[spec],
+            stroke_vert_color,
+            fill_vert_color,
+            hide_stroke,
+            hide_fill,
+        )
+
+    return node_to_mat_info
+
+
+# ============== functions for building geometry ==============
+
+
+@dataclass
 class StrokeData:
     position: np.ndarray  # shape (N, 3)
     handle_left: np.ndarray  # shape (N, 3)
@@ -268,19 +573,6 @@ def _path_to_stroke_data(
         end_stroke(False)
 
     return strokes
-
-
-def _srgb_transfer_func(r: float) -> float:
-    return r / 12.92 if r <= 0.04045 else pow((r + 0.055) / 1.055, 2.4)
-
-
-def _srgb_to_linear(col: tuple[float, float, float, float]):
-    return (
-        _srgb_transfer_func(col[0]),
-        _srgb_transfer_func(col[1]),
-        _srgb_transfer_func(col[2]),
-        col[3],
-    )
 
 
 DomainType = Literal["CURVE", "POINT"]
@@ -361,166 +653,6 @@ class LayerBuilder:
         drawing.tag_positions_changed()
 
 
-@dataclass
-class BuildOptions:
-    scale: float
-    stroke_grad_strat: Literal["AVERAGE", "VERTEX"]
-    fill_grad_strat: Literal["AVERAGE", "GRADIENT", "TEXTURE"]
-
-
-@dataclass
-class BuildContext:
-    # inputs
-    gp: bpy.types.GreasePencil
-    nodes_to_layers: Mapping[PaintNode, bpy.types.GreasePencilLayer]
-    opts: BuildOptions
-    scale_vec: np.ndarray
-    is_mask: bool
-    is_clip: bool
-
-    # state
-    material_idxs: dict[tuple | Literal["mask"], int]
-    cur_fill_id: int
-    visited: set[int]
-
-    # outputs
-    layer_to_builder: dict[str, LayerBuilder]
-
-
-def _create_gradient_image(grad: Gradient):
-    if isinstance(grad.attrs, LinearGradAttrs):
-        # NOTE: blender's current behavior for texture clamping is to clamp
-        # right at the edge of the texture, which means it partially wraps to
-        # the other side of the texture and so the color ends up being a mix
-        # of the pixels on opposite sides of the texture. this is undesired
-        # for padded linear gradients, of course.
-        # to partially work around this, we split the texture into thirds
-        # and fill the first and last thirds with padding manually, to at
-        # least give some buffer space
-        IMG_W = 512 if grad.spread == StrokeFill.PAD else 128
-        img = bpy.data.images.new("gradient", IMG_W, 1, alpha=True)
-        for i in range(IMG_W):
-            if grad.spread == StrokeFill.PAD:
-                t = max(0, min(1, 3 * i / IMG_W - 1))
-            else:
-                t = i / (IMG_W - 1)
-            col = grad.eval_stops(t)
-            img.pixels[i * 4 : (i + 1) * 4] = col  # type: ignore
-        img.update()
-        return img
-    else:
-        raise NotImplementedError
-
-
-def _should_use_gradient_fill(ctx: BuildContext, grad: Gradient):
-    return (
-        ctx.opts.fill_grad_strat == "GRADIENT"
-        and len(grad.stops) == 2
-        and grad.spread == StrokeFill.PAD
-        # cannot represent radial gradients when the first stop is not at center
-        and not (isinstance(grad.attrs, RadialGradAttrs) and grad.stops[0][0] > 0)
-    )
-
-
-def _setup_material_fill_gradient(
-    ctx: BuildContext, gp_style: bpy.types.MaterialGPencilStyle, grad: Gradient
-):
-    if _should_use_gradient_fill(ctx, grad):
-        gp_style.fill_style = "GRADIENT"
-        gp_style.gradient_type = (
-            "LINEAR" if isinstance(grad.attrs, LinearGradAttrs) else "RADIAL"
-        )
-        gp_style.fill_color = _srgb_to_linear(grad.stops[0][1])  # type: ignore
-        gp_style.mix_color = _srgb_to_linear(grad.stops[1][1])  # type: ignore
-    else:
-        gp_style.fill_style = "TEXTURE"
-        gp_style.fill_image = _create_gradient_image(grad)
-        gp_style.texture_clamp = grad.spread == StrokeFill.PAD
-    gp_style.mix_factor = 0
-    gp_style.texture_offset = (-0.5, -0.5)
-    gp_style.texture_angle = 0
-    gp_style.texture_scale = (1, 1)
-
-
-def _get_material(
-    ctx: BuildContext, stroke_color: StrokeColor, fill_color: FillColor
-) -> int:
-    no_fill = fill_color == (0, 0, 0, 0)
-    if isinstance(stroke_color, Gradient):
-        if ctx.opts.stroke_grad_strat == "AVERAGE":
-            stroke_color = stroke_color.avg_color()
-        elif len(stroke_color.stops) == 1:
-            stroke_color = stroke_color.stops[0][1]
-        elif len(stroke_color.stops) == 0:
-            stroke_color = None
-    if isinstance(fill_color, Gradient):
-        if ctx.opts.fill_grad_strat == "AVERAGE":
-            fill_color = fill_color.avg_color()
-        elif len(fill_color.stops) == 1:
-            fill_color = fill_color.stops[0][1]
-        elif len(fill_color.stops) == 0:
-            fill_color = (0, 0, 0, 1)
-    stroke_key = (
-        stroke_color.key() if isinstance(stroke_color, Gradient) else stroke_color
-    )
-    fill_key = fill_color.key() if isinstance(fill_color, Gradient) else fill_color
-    key = (stroke_key, fill_key)
-    if key in ctx.material_idxs:
-        return ctx.material_idxs[key]
-
-    material = bpy.data.materials.new(ctx.gp.name + "_Material")
-    bpy.data.materials.create_gpencil_data(material)
-    ctx.gp.materials.append(material)
-    idx = len(ctx.gp.materials) - 1
-    ctx.material_idxs[key] = idx
-
-    assert material.grease_pencil
-
-    if isinstance(stroke_color, Gradient):
-        # this color doesn't really matter since we're gonna be
-        # covering it up with vertex colors
-        material.grease_pencil.color = (0, 0, 0, 1)  # type: ignore
-    elif stroke_color:
-        material.grease_pencil.color = _srgb_to_linear(stroke_color)  # type: ignore
-    else:
-        # opaque black is more visible if user turns strokes back on
-        material.grease_pencil.color = (0, 0, 0, 1)  # type: ignore
-
-    if isinstance(fill_color, Gradient):
-        _setup_material_fill_gradient(ctx, material.grease_pencil, fill_color)
-    elif fill_color:
-        if no_fill:
-            # opaque black is more visible if user turns fills back on
-            fill_color = (0, 0, 0, 1)
-        material.grease_pencil.fill_color = _srgb_to_linear(fill_color)  # type: ignore
-
-    return idx
-
-
-def _get_mask_material(ctx: BuildContext) -> int:
-    if "mask" in ctx.material_idxs:
-        return ctx.material_idxs["mask"]
-
-    material = bpy.data.materials.new(ctx.gp.name + "_MaskMaterial")
-    bpy.data.materials.create_gpencil_data(material)
-    ctx.gp.materials.append(material)
-    idx = len(ctx.gp.materials) - 1
-    ctx.material_idxs["mask"] = idx
-
-    assert material.grease_pencil
-    material.grease_pencil.fill_color = (1, 1, 1, 1)  # type: ignore
-    material.grease_pencil.color = (1, 1, 1, 1)  # type: ignore
-
-    return idx
-
-
-@dataclass
-class StrokeUVTransforms:
-    translation: tuple[float, float]
-    rotation: float
-    scale: tuple[float, float]
-
-
 def _get_curve_normal(positions: np.ndarray) -> np.ndarray:
     # needed to accurately compute the stroke's local coordinate system.
     # ported from blender:
@@ -544,6 +676,13 @@ def _get_curve_normal(positions: np.ndarray) -> np.ndarray:
                 normal = normalize(np.array((segment_vec[1], -segment_vec[0], 0.0)))
                 break
     return normal
+
+
+@dataclass
+class StrokeUVTransforms:
+    translation: tuple[float, float]
+    rotation: float
+    scale: tuple[float, float]
 
 
 def _get_uv_transforms(
@@ -624,173 +763,214 @@ def _get_uv_transforms(
         raise NotImplementedError
 
 
-def _get_gradient_vertex_colors(local_positions: np.ndarray, grad: Gradient):
+def _get_gradient_vertex_color_attrs(
+    local_positions: np.ndarray, grad: Gradient
+) -> tuple[np.ndarray, np.ndarray]:
+    """Given positions in the gradient's local space, return appropriate
+    vertex colors (shape (N, 4)) and opacities (shape (N,)) that approximate
+    the given gradient.
+    """
     colors = np.array([grad.eval_pos(pos) for pos in local_positions])
     opacity = colors[..., 3].copy()
     colors[..., 3] = 1
     return colors, opacity
 
 
-def _gather_geometry_and_materials_data(ctx: BuildContext, node: PaintNode):
-    # we may visit a node multiple times if e.g. the simplification process
-    # assigns the same mask node to multiple nodes
-    if node.addr in ctx.visited:
-        return
-    ctx.visited.add(node.addr)
+def _get_solid_vertex_color_attrs(
+    n: int, color: Float4
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return vertex color (shape (N, 4)) and opacity (shape (N,)) attribute
+    data with the given length.
+    """
+    colors = np.repeat([color], n, axis=0)
+    opacity = colors[..., 3].copy()
+    colors[..., 3] = 1
+    return colors, opacity
 
-    if not isinstance(node, (GroupNode, ShapeNode)):
-        return
 
-    if node.mask:
-        _gather_geometry_and_materials_data(replace(ctx, is_mask=True), node.mask)
-    if node.clip:
-        _gather_geometry_and_materials_data(replace(ctx, is_clip=True), node.clip)
+@dataclass
+class GatherGeometryData:
+    # inputs
+    gp: bpy.types.GreasePencil
+    nodes_to_layers: dict[PaintNode, bpy.types.GreasePencilLayer]
+    nodes_to_mat_info: dict[ShapeNode, ShapeMaterialInfo]
+    opts: BuildOptions
+    scale_vec: np.ndarray
+    # state
+    cur_fill_id: int
+    # outputs
+    layer_to_builder: dict[str, LayerBuilder]
 
-    if isinstance(node, GroupNode):
-        for child in node.children:
-            _gather_geometry_and_materials_data(ctx, child)
-    elif isinstance(node, ShapeNode):
-        strokes = _path_to_stroke_data(node)
-        if not strokes:
-            return  # for safety (otherwise add_strokes will crash)
 
-        layer = ctx.nodes_to_layers[node]
-        if layer.name not in ctx.layer_to_builder:
-            ctx.layer_to_builder[layer.name] = LayerBuilder(layer)
-        builder = ctx.layer_to_builder[layer.name]
+def _gather_geometry_callback(
+    ctx: VisitShapesContext[GatherGeometryData], node: ShapeNode
+):
+    strokes = _path_to_stroke_data(node)
+    if not strokes:
+        return  # for safety (otherwise add_strokes will crash)
 
-        builder.add_stroke_lengths([len(s.position) for s in strokes])
+    ctxd = ctx.data
+    layer = ctxd.nodes_to_layers[node]
+    if layer.name not in ctxd.layer_to_builder:
+        ctxd.layer_to_builder[layer.name] = LayerBuilder(layer)
+    builder = ctxd.layer_to_builder[layer.name]
 
-        if ctx.is_mask or ctx.is_clip:
-            mat_idx = _get_mask_material(ctx)
-        else:
-            mat_idx = _get_material(ctx, node.stroke_color, node.fill_color)
-        # note: clip paths do not take stroke width into account
-        no_stroke = node.stroke_color is None or ctx.is_clip
-        no_fill = node.fill_color == (0, 0, 0, 0)
+    stroke_lengths = [len(s.position) for s in strokes]
+    builder.add_stroke_lengths(stroke_lengths)
 
-        if ctx.opts.stroke_grad_strat == "VERTEX" and isinstance(
-            node.stroke_color, Gradient
-        ):
-            # transform positions back to node's local svg coordinates
-            ps = np.vstack([s.position for s in strokes])
-            ps = np.delete(ps, 1, axis=-1)
-            ps = np.pad(ps, [(0, 0), (0, 1)], constant_values=1)
-            ps = ps[..., np.newaxis]
-            inverse_transform = np.linalg.inv(node.world_transform)
-            ps = (inverse_transform @ ps)[..., :2, 0]
-            vertex_color, opacity = _get_gradient_vertex_colors(ps, node.stroke_color)
-        else:
-            vertex_color, opacity = None, None
+    shape_mat_info = ctxd.nodes_to_mat_info[node]
+    mat_idx = shape_mat_info.mat_idx
+    # note: clip paths do not take stroke width into account
+    no_stroke = shape_mat_info.hide_stroke or ctx.is_clip
+    no_fill = shape_mat_info.hide_fill and not ctx.is_clip
 
-        # point-domain attributes
-        transformed_positions = [ctx.scale_vec * s.position for s in strokes]
-        position = np.vstack(transformed_positions)
-        handle_left = ctx.scale_vec * np.vstack([s.handle_left for s in strokes])
-        handle_right = ctx.scale_vec * np.vstack([s.handle_right for s in strokes])
-        handle_type = np.full((len(position),), 0, dtype=np.int8)  # 0 => free
-        radius = np.full(
-            (len(position),), node.stroke_width * ctx.opts.scale * 0.5, dtype=np.float32
+    stroke_vert_color = shape_mat_info.stroke_vert_color
+    fill_vert_color = shape_mat_info.fill_vert_color
+    if isinstance(stroke_vert_color, Gradient):
+        # transform positions back to node's local svg coordinates
+        ps = np.vstack([s.position for s in strokes])
+        ps = np.delete(ps, 1, axis=-1)
+        ps = np.pad(ps, [(0, 0), (0, 1)], constant_values=1)
+        ps = ps[..., np.newaxis]
+        inverse_transform = np.linalg.inv(node.world_transform)
+        ps = (inverse_transform @ ps)[..., :2, 0]
+        vertex_color, opacity = _get_gradient_vertex_color_attrs(ps, stroke_vert_color)
+    elif isinstance(stroke_vert_color, tuple):
+        vertex_color, opacity = _get_solid_vertex_color_attrs(
+            sum(stroke_lengths), stroke_vert_color
         )
-        builder.append_to_attr("position", "FLOAT_VECTOR", "POINT", position)
-        builder.append_to_attr("handle_left", "FLOAT_VECTOR", "POINT", handle_left)
-        builder.append_to_attr("handle_right", "FLOAT_VECTOR", "POINT", handle_right)
-        builder.append_to_attr("handle_type_left", "INT8", "POINT", handle_type)
-        builder.append_to_attr("handle_type_right", "INT8", "POINT", handle_type)
-        builder.append_to_attr("radius", "FLOAT", "POINT", radius)
-        if node.stroke_join != StrokeJoin.ROUND:
-            if node.stroke_join == StrokeJoin.MITER:
-                # thanks mdn
-                angle = 2 * math.asin(1 / node.stroke_miterlimit)
-                # NOTE: currently, blender rounds miter angles to nearest pi/62
-                # during the packing process:
-                # https://projects.blender.org/blender/blender/src/commit/4d6a448ec8e203a080b276c34ae73fb91078d088/source/blender/draw/intern/draw_cache_impl_grease_pencil.cc#L264
-                # this can cause some points close to the miter angle to have
-                # incorrect miter cutoff status.
-                # err on the side of keeping the miter, so the user can fix it
-                # themselves if needed by setting corner type to Flat
-                angle = math.floor(angle / math.pi * 62) / 62 * math.pi
-            else:  # node.stroke_join == StrokeJoin.BEVEL
-                angle = 3.142
-            miter_angle = np.full((len(position),), angle, dtype=np.float32)
-            builder.append_to_attr("miter_angle", "FLOAT", "POINT", miter_angle)
-        if vertex_color is not None and opacity is not None:
-            builder.append_to_attr("vertex_color", "FLOAT_COLOR", "POINT", vertex_color)
-            builder.append_to_attr("opacity", "FLOAT", "POINT", opacity, 1)
+    else:
+        vertex_color, opacity = None, None
 
-        # curve-domain attributes
-        if no_fill:
-            fill_id_val = 0
-        else:
-            fill_id_val = ctx.cur_fill_id
-            ctx.cur_fill_id += 1
-        cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
-        fill_id = np.full((len(strokes),), fill_id_val, dtype=np.int32)
-        material_index = np.full((len(strokes),), mat_idx, dtype=np.int32)
-        builder.append_to_attr("cyclic", "BOOLEAN", "CURVE", cyclic)
-        builder.append_to_attr("fill_id", "INT", "CURVE", fill_id)
-        builder.append_to_attr("material_index", "INT", "CURVE", material_index)
-        if no_stroke:
-            hide_stroke = np.full((len(strokes),), no_stroke, dtype=np.bool)
-            builder.append_to_attr("hide_stroke", "BOOLEAN", "CURVE", hide_stroke)
-        if node.stroke_cap != StrokeCap.ROUND:
-            # TODO: proper square cap support? (maybe by adding new points at the ends)
-            cap = np.full((len(strokes),), 1, dtype=np.int8)  # 0 => flat
-            builder.append_to_attr("start_cap", "INT8", "CURVE", cap)
-            builder.append_to_attr("end_cap", "INT8", "CURVE", cap)
-        if ctx.gp.materials[mat_idx].grease_pencil.fill_style != "SOLID":  # type: ignore
-            grad = node.fill_color
-            assert isinstance(grad, Gradient)
-            is_using_gradient_fill = _should_use_gradient_fill(ctx, grad)
-            account_for_trim = is_using_gradient_fill
-            has_padding = (
-                not is_using_gradient_fill
-                and isinstance(grad.attrs, LinearGradAttrs)
-                and grad.spread == StrokeFill.PAD
+    # point-domain attributes
+    transformed_positions = [ctxd.scale_vec * s.position for s in strokes]
+    position = np.vstack(transformed_positions)
+    handle_left = ctxd.scale_vec * np.vstack([s.handle_left for s in strokes])
+    handle_right = ctxd.scale_vec * np.vstack([s.handle_right for s in strokes])
+    handle_type = np.full((len(position),), 0, dtype=np.int8)  # 0 => free
+    radius = np.full(
+        (len(position),), node.stroke_width * ctxd.opts.scale * 0.5, dtype=np.float32
+    )
+    builder.append_to_attr("position", "FLOAT_VECTOR", "POINT", position)
+    builder.append_to_attr("handle_left", "FLOAT_VECTOR", "POINT", handle_left)
+    builder.append_to_attr("handle_right", "FLOAT_VECTOR", "POINT", handle_right)
+    builder.append_to_attr("handle_type_left", "INT8", "POINT", handle_type)
+    builder.append_to_attr("handle_type_right", "INT8", "POINT", handle_type)
+    builder.append_to_attr("radius", "FLOAT", "POINT", radius)
+    if node.stroke_join != StrokeJoin.ROUND:
+        if node.stroke_join == StrokeJoin.MITER:
+            # thanks mdn
+            angle = 2 * math.asin(1 / node.stroke_miterlimit)
+            # NOTE: currently, blender rounds miter angles to nearest pi/62
+            # during the packing process:
+            # https://projects.blender.org/blender/blender/src/commit/4d6a448ec8e203a080b276c34ae73fb91078d088/source/blender/draw/intern/draw_cache_impl_grease_pencil.cc#L264
+            # this can cause some points close to the miter angle to have
+            # incorrect miter cutoff status.
+            # err on the side of keeping the miter, so the user can fix it
+            # themselves if needed by setting corner type to Flat
+            angle = math.floor(angle / math.pi * 62) / 62 * math.pi
+        else:  # node.stroke_join == StrokeJoin.BEVEL
+            angle = 3.142
+        miter_angle = np.full((len(position),), angle, dtype=np.float32)
+        builder.append_to_attr("miter_angle", "FLOAT", "POINT", miter_angle)
+    if vertex_color is not None and opacity is not None:
+        builder.append_to_attr("vertex_color", "FLOAT_COLOR", "POINT", vertex_color)
+        builder.append_to_attr("opacity", "FLOAT", "POINT", opacity, 1)
+
+    # curve-domain attributes
+    if no_fill:
+        fill_id_val = 0
+    else:
+        fill_id_val = ctxd.cur_fill_id
+        ctxd.cur_fill_id += 1
+    cyclic = np.array([s.cyclic for s in strokes], dtype=np.bool)
+    fill_id = np.full((len(strokes),), fill_id_val, dtype=np.int32)
+    material_index = np.full((len(strokes),), mat_idx, dtype=np.int32)
+    builder.append_to_attr("cyclic", "BOOLEAN", "CURVE", cyclic)
+    builder.append_to_attr("fill_id", "INT", "CURVE", fill_id)
+    builder.append_to_attr("material_index", "INT", "CURVE", material_index)
+    if no_stroke:
+        hide_stroke = np.full((len(strokes),), no_stroke, dtype=np.bool)
+        builder.append_to_attr("hide_stroke", "BOOLEAN", "CURVE", hide_stroke)
+    if node.stroke_cap != StrokeCap.ROUND:
+        # TODO: proper square cap support? (maybe by adding new points at the ends)
+        cap = np.full((len(strokes),), 1, dtype=np.int8)  # 0 => flat
+        builder.append_to_attr("start_cap", "INT8", "CURVE", cap)
+        builder.append_to_attr("end_cap", "INT8", "CURVE", cap)
+    if fill_vert_color is not None:
+        fill_color, fill_opacity = _get_solid_vertex_color_attrs(
+            len(strokes), fill_vert_color
+        )
+        builder.append_to_attr("fill_color", "FLOAT_COLOR", "CURVE", fill_color)
+        builder.append_to_attr("fill_opacity", "FLOAT", "CURVE", fill_opacity, 1)
+    if ctxd.gp.materials[mat_idx].grease_pencil.fill_style != "SOLID":  # type: ignore
+        grad = node.fill_color
+        assert isinstance(grad, Gradient)
+        is_using_gradient_fill = _should_use_gradient_fill(ctxd.opts, grad)
+        account_for_trim = is_using_gradient_fill
+        has_padding = (
+            not is_using_gradient_fill
+            and isinstance(grad.attrs, LinearGradAttrs)
+            and grad.spread == StrokeFill.PAD
+        )
+        uvs = [
+            _get_uv_transforms(
+                positions,
+                grad,
+                ctxd.opts.scale,
+                node.world_transform,
+                account_for_trim,
+                has_padding,
             )
-            uvs = [
-                _get_uv_transforms(
-                    positions,
-                    grad,
-                    ctx.opts.scale,
-                    node.world_transform,
-                    account_for_trim,
-                    has_padding,
-                )
-                for positions in transformed_positions
-            ]
-            uv_rotation = np.array([uv.rotation for uv in uvs], dtype=np.float32)
-            uv_translation = np.array([uv.translation for uv in uvs], dtype=np.float32)
-            uv_scale = np.array([uv.scale for uv in uvs], dtype=np.float32)
-            builder.append_to_attr("uv_rotation", "FLOAT", "CURVE", uv_rotation)
-            builder.append_to_attr("uv_translation", "FLOAT2", "CURVE", uv_translation)
-            builder.append_to_attr("uv_scale", "FLOAT2", "CURVE", uv_scale)
+            for positions in transformed_positions
+        ]
+        uv_rotation = np.array([uv.rotation for uv in uvs], dtype=np.float32)
+        uv_translation = np.array([uv.translation for uv in uvs], dtype=np.float32)
+        uv_scale = np.array([uv.scale for uv in uvs], dtype=np.float32)
+        builder.append_to_attr("uv_rotation", "FLOAT", "CURVE", uv_rotation)
+        builder.append_to_attr("uv_translation", "FLOAT2", "CURVE", uv_translation)
+        builder.append_to_attr("uv_scale", "FLOAT2", "CURVE", uv_scale)
+
+
+def _gather_geometry(
+    gp: bpy.types.GreasePencil,
+    root_node: PaintNode,
+    nodes_to_layers: dict[PaintNode, bpy.types.GreasePencilLayer],
+    nodes_to_mat_info: dict[ShapeNode, ShapeMaterialInfo],
+    opts: BuildOptions,
+):
+    # negate Z to flip Z-down convention to Z-up
+    scale_vec = np.array([opts.scale, opts.scale, -opts.scale])
+    ctx = VisitShapesContext(
+        is_mask=False,
+        is_clip=False,
+        visited=set(),
+        data=GatherGeometryData(
+            gp=gp,
+            nodes_to_layers=nodes_to_layers,
+            nodes_to_mat_info=nodes_to_mat_info,
+            opts=opts,
+            scale_vec=scale_vec,
+            cur_fill_id=1,
+            layer_to_builder={},
+        ),
+    )
+    _visit_shapes(ctx, root_node, _gather_geometry_callback)
+    return ctx.data.layer_to_builder
 
 
 def _create_geometry_and_materials(
     gp: bpy.types.GreasePencil,
     root_node: PaintNode,
-    nodes_to_layers: Mapping[PaintNode, bpy.types.GreasePencilLayer],
+    nodes_to_layers: dict[PaintNode, bpy.types.GreasePencilLayer],
     opts: BuildOptions,
 ):
-    # negate Z to flip Z-down convention to Z-up
-    scale_vec = np.array([opts.scale, opts.scale, -opts.scale])
-
-    ctx = BuildContext(
-        gp=gp,
-        nodes_to_layers=nodes_to_layers,
-        opts=opts,
-        scale_vec=scale_vec,
-        is_mask=False,
-        is_clip=False,
-        material_idxs={},
-        cur_fill_id=1,
-        visited=set(),
-        layer_to_builder={},
+    color_descs = _gather_color_descs(opts, root_node)
+    nodes_to_mat_info = _build_materials(gp, color_descs, opts)
+    layer_to_builder = _gather_geometry(
+        gp, root_node, nodes_to_layers, nodes_to_mat_info, opts
     )
-    _gather_geometry_and_materials_data(ctx, root_node)
-
-    for builder in ctx.layer_to_builder.values():
+    for builder in layer_to_builder.values():
         builder.build()
 
 
@@ -825,6 +1005,11 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
     center_geometry: bpy.props.BoolProperty(
         name="Center Geometry",
         description="Center the geometry's bounding box on the origin",
+        default=True,
+    )
+    use_vertex_colors: bpy.props.BoolProperty(
+        name="Use Vertex Colors",
+        description="Use vertex colors instead of materials for coloring strokes, only falling back on materials for fill gradients",
         default=True,
     )
     stroke_grad_strat: bpy.props.EnumProperty(
@@ -883,6 +1068,7 @@ class FLASHY_OP_import_svg(bpy.types.Operator, ImportHelper):
         obj_name = os.path.basename(path)
         options = BuildOptions(
             scale=self.scale,
+            use_vertex_colors=self.use_vertex_colors,
             stroke_grad_strat=self.stroke_grad_strat,
             fill_grad_strat=self.fill_grad_strat,
         )
