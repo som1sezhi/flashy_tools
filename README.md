@@ -27,3 +27,23 @@ Some notes/caveats:
     - If an object in multiple collections has skew controls added, the _shearcalc will be added to an arbitrary collection.
     - Removing skew controls from an object/bone will also remove the _shearcalc object if it is not needed anymore. However, deleting the object/bone itself will not automatically remove the _shearcalc; you'll need to do so manually.
 - Duplicating objects/bones with the skew controls will also duplicate the constraints, leading to glitchy behavior where the original controls affect both objects. To resolve this, select the duplicate object/bone and then remove and re-add skew controls.
+
+### Frame Picker
+
+Allows you to quickly set up a frame picker control for the currently selected Grease Pencil layer or layer group. This creates a custom property on a user-specified bone that drives a frame offset on a Time Offset modifier on the Grease Pencil object, allowing animators to choose the frame being displayed. Optionally, pose assets can be generated for each frame drawing (with thumbnails), allowing animators to quickly apply frames similar to Adobe Animate's Frame Picker.
+
+TODO: add screenshots
+
+### Improved SVG to Grease Pencil Import
+
+This is an alternative to the built-in SVG to Grease Pencil importer in Blender, expanding support for many SVG features, including:
+
+- Gradient strokes and fills
+    - Gradient strokes are approximated with vertex colors
+    - Gradient fills can be recreated using material gradient fills wherever possible, or via generating a gradient image texture and using that as the fill. Te latter is especially useful for gradients with 3+ stops, as Blender does not yet have support for these gradients.
+- Basic mask and clip setups
+- `<use>` tag resolution
+
+This importer is powered by [ThorVG](https://www.thorvg.org/) via [thorvg-python](https://github.com/laggykiller/thorvg-python).
+
+TODO: more info
